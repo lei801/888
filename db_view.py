@@ -28,7 +28,7 @@ import analysis
 from analysis import column_defs, join_clause, classify_line   # 指标列定义 / SQL JOIN 均来自 analysis
 
 # 表格展示最多加载的行数（仅影响界面渲染，不影响 CSV 导出）；None = 不限制，全量显示
-VIEW_ROW_LIMIT = None
+VIEW_ROW_LIMIT = 200
 
 # 有数据库索引、允许点击表头排序的列（与 analysis._create_csv_indexes 对齐：
 #   idx_processed_device -> 设备；idx_processed_ym -> 月份）。其余列点击表头不再排序。
@@ -54,6 +54,7 @@ class DBViewApp:
         self._visible_cols, self._visible_fixed = self._load_visible_cols()
         self._build_ui(devs, yms)
         self._refresh()
+        self._autosize_columns()   # 首次打开测量一次列宽（之后仅在列结构变化时重算）
 
     def _apply_style(self):
         """统一字体 + 让表格行高随字体自适应（高分辨率下随 DPI 放大、不被裁切）。"""
@@ -340,6 +341,8 @@ class DBViewApp:
         self._col_index = self._make_col_index()
         # 清掉手动宽度记录（列结构已变，旧记录无意义）
         self._manual_widths = set()
+        # 仅列结构变化时才重新测量列宽（避免每次筛选刷新都卡）
+        self._autosize_columns()
 
     def _reset_filters(self):
         self.line_lb.selection_clear(0, "end")
@@ -504,17 +507,20 @@ class DBViewApp:
         else:
             self.stat_var.set(f"共 {total} 个文件")
         self._update_headings()
-        self._autosize_columns()
 
     def _autosize_columns(self):
         """按表头文字 + 当前可见行内容自动撑开列宽（取最大值，留少量边距）。
-        路径列保持拉伸；用户手动拖拽过的列不再自动调整。"""
+        路径列保持拉伸；用户手动拖拽过的列不再自动调整。
+        仅在列结构变化 / 首次打开时调用一次，避免每次筛选刷新都卡顿。"""
         import tkinter.font as tkfont
-        # 直接用字体描述创建测量用字体对象（不依赖 nametofont 的 name 查找，
-        # 避免某些 tk 版本下 name 查找失败 / 误报 -font 选项）。
-        font = tkfont.Font(font=("Microsoft YaHei", 10))
-        head_font = tkfont.Font(font=("Microsoft YaHei", 9, "bold"))
+        # 缓存测量字体对象（避免每次重算都 new，进一步加速）
+        if not hasattr(self, "_measure_font") or self._measure_font is None:
+            self._measure_font = tkfont.Font(font=("Microsoft YaHei", 10))
+            self._measure_head_font = tkfont.Font(font=("Microsoft YaHei", 9, "bold"))
+        font = self._measure_font
+        head_font = self._measure_head_font
         PAD = 12
+        SAMPLE = 120   # 仅采样当前显示的前 120 行测宽度（原采样 300 行，降为 120 进一步加速）
         for col in self.cols:
             # 路径列随窗口拉伸，不自动收缩
             if col == "路径":
@@ -524,9 +530,9 @@ class DBViewApp:
                 continue
             # 表头宽度
             head_w = head_font.measure(col) + PAD + 8  # +8 给排序箭头留位
-            # 内容宽度：采样前 300 行取最大值（全量行数大时逐行测量会卡）
+            # 内容宽度：采样前若干行取最大值
             content_w = 0
-            for iid in self.tree.get_children()[:300]:
+            for iid in self.tree.get_children()[:SAMPLE]:
                 v = self.tree.set(iid, col)
                 w = font.measure(v) + PAD
                 if w > content_w:
@@ -615,73 +621,93 @@ class DBViewApp:
         result = []
         saved = self._load_export_cols()
 
-        def header_of(name):
-            return "序号" if name == "#" else name
-
         dlg = tk.Toplevel(self.root)
         dlg.title("选择导出列")
         dlg.grab_set()          # 模态（不调用 transient，以保留最大/最小化按钮）
         dlg.resizable(True, True)
+        dlg.geometry("820x680")  # 整体放大，避免勾选区被压缩、底部按钮被挤出
         dlg.withdraw()   # 先隐藏，避免默认位置闪现
         # 导出始终提供「全部列」选择（固定列 + 全量指标列），不受查看器可见列影响
-        exportable = _FIXED_COLS + self._all_metric_cols_list
-        vars_ = {}
+        metric_cols = self._all_metric_cols_list
         frm = ttk.Frame(dlg, padding=10)
         frm.pack(fill="both", expand=True)
         ttk.Label(frm, text="选择要导出的列（默认沿用上次选择）：").pack(anchor="w", pady=(0, 6))
-        # 可滚动勾选区：动态加高封顶，与「显示列」一致
-        _rows = max(1, (len(exportable) + 1) // 2)
-        _box_h = min(max(120, _rows * 24 + 16), 360)
-        _canv_frame = ttk.Frame(frm, borderwidth=1, relief="solid")
-        _canv_frame.pack(fill="x", pady=(0, 6))
-        _canv = tk.Canvas(_canv_frame, highlightthickness=0, height=_box_h,
-                          width=560)
-        _sb = ttk.Scrollbar(_canv_frame, orient="vertical", command=_canv.yview)
-        _inner = ttk.Frame(_canv)
-        _canv.configure(yscrollcommand=_sb.set)
-        _canv.pack(side="left", fill="both", expand=True)
-        _sb.pack(side="right", fill="y")
-        # 让内部 Frame 宽度随 Canvas 自适应，并动态更新滚动范围
-        def _on_inner_configure(e):
-            _canv.configure(scrollregion=_canv.bbox("all"))
-            _canv.itemconfig("inner_win", width=_canv.winfo_width())
-        _inner.bind("<Configure>", _on_inner_configure)
-        _canv.create_window((0, 0), window=_inner, anchor="nw", tags="inner_win")
-        # 鼠标滚轮（中键/触控板）滚动：Canvas 自定义容器无原生滚轮，需手动绑定
-        _canv.bind("<MouseWheel>",
-                   lambda e: _canv.yview_scroll(int(-e.delta / 120), "units"))
-        _canv.bind("<Button-4>",
-                   lambda e: _canv.yview_scroll(-1, "units"))
-        _canv.bind("<Button-5>",
-                   lambda e: _canv.yview_scroll(1, "units"))
-        # 自适应列数：按 Canvas 可用宽度估算每行列数，对话框拉伸时自动重排
-        _EXP_COL_W = 170  # 每列估算像素宽度
-        _exp_widgets = []
-        for name in exportable:
-            # 有历史选择则按历史；无历史则默认全选
-            init = name in saved if saved is not None else True
-            v = tk.BooleanVar(value=init)
-            vars_[name] = v
-            _exp_widgets.append(
-                ttk.Checkbutton(_inner, text=header_of(name), variable=v))
 
-        def _relayout_exp():
-            _w = _canv.winfo_width()
+        # ---- 固定列分组（横排，与「显示列」布局一致） ----
+        fixed_frm = ttk.Frame(frm, borderwidth=1, relief="solid")
+        fixed_frm.pack(fill="x", pady=(0, 8))
+        fvars = {}
+        _fixed_names = {"#": "序号", "设备": "设备", "月份": "月份",
+                        "路径": "路径", "大小": "大小", "处理时间": "处理时间"}
+        for i, col in enumerate(_FIXED_COLS):
+            init = col in saved if saved is not None else True
+            v = tk.BooleanVar(value=init)
+            fvars[col] = v
+            ttk.Checkbutton(fixed_frm, text=_fixed_names[col],
+                            variable=v).grid(row=0, column=i, sticky="w",
+                                             padx=8, pady=2)
+
+        ttk.Label(frm, text="指标列：").pack(anchor="w", pady=(0, 6))
+
+        # 可滚动的勾选区：自适应列数（参照主程序手动导出列），窗口拉伸时自动重排
+        canv_frame = ttk.Frame(frm, borderwidth=1, relief="solid")
+        canv_frame.pack(fill="both", expand=True, pady=(0, 8))
+        canv = tk.Canvas(canv_frame, highlightthickness=0, width=760, height=420)
+        sb = ttk.Scrollbar(canv_frame, orient="vertical", command=canv.yview)
+        inner = ttk.Frame(canv)
+        inner.bind("<Configure>",
+                   lambda e: canv.configure(scrollregion=canv.bbox("all")))
+        _win = canv.create_window((0, 0), window=inner, anchor="nw")
+        canv.bind("<Configure>",
+                  lambda e: canv.itemconfigure(_win, width=e.width))
+        canv.configure(yscrollcommand=sb.set)
+        canv.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        # 鼠标滚轮（中键/触控板）滚动
+        canv.bind("<MouseWheel>",
+                  lambda e: canv.yview_scroll(int(-e.delta / 120), "units"))
+        canv.bind("<Button-4>",
+                  lambda e: canv.yview_scroll(-1, "units"))
+        canv.bind("<Button-5>",
+                  lambda e: canv.yview_scroll(1, "units"))
+
+        vars_ = {}
+        # metric_cols 里是 label（中文显示名），需经 _label2key 反查回 METRICS 的 key
+        l2k = getattr(self, "_label2key", {}) or {}
+        _exp_widgets = []
+        for label in metric_cols:
+            key = l2k.get(label, label)
+            init = label in saved if saved is not None else True
+            v = tk.BooleanVar(value=init)
+            vars_[label] = v
+            wd = ttk.Checkbutton(inner, text="%s  (%s)" % (label, key), variable=v)
+            _exp_widgets.append(wd)
+
+        # 自适应列数：按 Canvas 可用宽度估算每行列数，窗口/面板拉伸时自动重排
+        _AUTO_COL_W = 150   # 每列估算像素宽度
+        def _relayout_exp_cols():
+            _w = canv.winfo_width()
             # 每列预留 padx 余量，避免最右列被 Canvas 边缘裁切、名称显示不全
-            _n = max(1, _w // (_EXP_COL_W + 10))
+            _n = max(1, _w // (_AUTO_COL_W + 14))
             for _i, _wd in enumerate(_exp_widgets):
-                _wd.grid(row=_i // _n, column=_i % _n, sticky="w", padx=4, pady=2)
-            _canv.configure(scrollregion=_canv.bbox("all"))
-        _canv.bind("<Configure>", lambda e: _relayout_exp())
+                _wd.grid(row=_i // _n, column=_i % _n, sticky="w",
+                         padx=(0, 14), pady=2)
+            canv.configure(scrollregion=canv.bbox("all"))
+
+        canv.bind("<Configure>", lambda e: _relayout_exp_cols())
+
         btn_frm = ttk.Frame(frm)
         btn_frm.pack(fill="x", pady=(8, 0))
 
         def select_all(val):
             for v in vars_.values():
                 v.set(val)
+            for v in fvars.values():
+                v.set(val)
 
         def on_ok():
-            sel = [n for n in exportable if vars_[n].get()]
+            sel = ([c for c in _FIXED_COLS if fvars[c].get()]
+                   + [n for n in metric_cols if vars_[n].get()])
             result.extend(sel)
             self._save_export_cols(sel)   # 持久化
             dlg.destroy()
@@ -695,7 +721,7 @@ class DBViewApp:
             side="left", padx=(0, 6))
         ttk.Button(btn_frm, text="取消", command=on_cancel).pack(
             side="right", padx=(6, 0))
-        ttk.Button(btn_frm, text="确认", command=on_ok, default="active").pack(side="right")
+        ttk.Button(btn_frm, text="确定", command=on_ok, default="active").pack(side="right")
         # 居中于父窗口后再显示（消除闪烁）
         dlg.update_idletasks()
         _w, _h = dlg.winfo_width(), dlg.winfo_height()
@@ -709,7 +735,7 @@ class DBViewApp:
 
     def _pick_visible_columns(self):
         """『显示列』对话框：勾选查看器表格要显示的列（固定列 + 指标列均可勾选隐藏）。
-        固定列横排在顶部，指标列两列排布于可滚动区。"""
+        固定列横排在顶部，指标列可滚动区自适应列数（窗口拉伸自动重排）。"""
         all_cols = self._all_metric_cols()
         labels = {k: analysis.METRICS[k]["label"] for k in all_cols}
         dlg = tk.Toplevel(self.root)
@@ -717,6 +743,7 @@ class DBViewApp:
         dlg.transient(self.root)
         dlg.grab_set()
         dlg.resizable(True, True)
+        dlg.geometry("820x680")  # 整体放大，避免勾选区被压缩、底部按钮被挤出
 
         frm = ttk.Frame(dlg, padding=10)
         frm.grid(row=0, column=0, sticky="nsew")
@@ -739,13 +766,11 @@ class DBViewApp:
 
         ttk.Label(frm, text="指标列：").grid(row=2, column=0, sticky="w", pady=(0, 6))
 
-        # 可滚动的勾选区（带边框）；两列排布，高度按指标数量动态加高，
-        # 封顶 420px，再高则走滚动条——既紧凑（列少不留大片空白）又不撑高对话框。
-        _rows = max(1, (len(all_cols) + 1) // 2)
-        _box_h = min(max(120, _rows * 30 + 20), 420)
+        # 可滚动的勾选区（带边框）：自适应列数，窗口拉伸时自动重排；
+        # 高度封顶 300px，再高则走滚动条——既紧凑（列少不留大片空白）又不撑高对话框。
         canv_frame = ttk.Frame(frm, borderwidth=1, relief="solid")
         canv_frame.grid(row=3, column=0, sticky="nsew")
-        canv = tk.Canvas(canv_frame, highlightthickness=0, width=560, height=_box_h)
+        canv = tk.Canvas(canv_frame, highlightthickness=0, width=760, height=420)
         sb = ttk.Scrollbar(canv_frame, orient="vertical", command=canv.yview)
         inner = ttk.Frame(canv)
         inner.bind("<Configure>",
@@ -757,52 +782,37 @@ class DBViewApp:
         canv.configure(yscrollcommand=sb.set)
         canv.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        # 鼠标滚轮（中键/触控板）滚动：Canvas 自定义容器无原生滚轮，需手动绑定
+        frm.rowconfigure(3, weight=1)
+        frm.columnconfigure(0, weight=1)
+        # 鼠标滚轮（中键/触控板）滚动
         canv.bind("<MouseWheel>",
                   lambda e: canv.yview_scroll(int(-e.delta / 120), "units"))
         canv.bind("<Button-4>",
                   lambda e: canv.yview_scroll(-1, "units"))
         canv.bind("<Button-5>",
                   lambda e: canv.yview_scroll(1, "units"))
-        frm.rowconfigure(3, weight=1)
-        frm.columnconfigure(0, weight=1)
 
         vars_ = {}
-        # 自适应列数：按 Canvas 可用宽度估算每行列数，对话框拉伸时自动重排
-        _VIS_COL_W = 220  # 每列估算像素宽度（显示列文字含列名，较宽）
         _vis_widgets = []
         for col in all_cols:
             v = tk.BooleanVar(value=col in self._visible_cols)
             vars_[col] = v
-            _vis_widgets.append(
-                ttk.Checkbutton(inner, text="%s  (%s)" % (labels[col], col),
-                                variable=v))
+            wd = ttk.Checkbutton(inner, text="%s  (%s)" % (labels[col], col),
+                                 variable=v)
+            _vis_widgets.append(wd)
 
-        def _relayout_vis():
+        # 自适应列数：按 Canvas 可用宽度估算每行列数，窗口/面板拉伸时自动重排
+        _AUTO_COL_W = 150   # 每列估算像素宽度
+        def _relayout_vis_cols():
             _w = canv.winfo_width()
             # 每列预留 padx 余量，避免最右列被 Canvas 边缘裁切、名称显示不全
-            _n = max(1, _w // (_VIS_COL_W + 10))
+            _n = max(1, _w // (_AUTO_COL_W + 14))
             for _i, _wd in enumerate(_vis_widgets):
                 _wd.grid(row=_i // _n, column=_i % _n, sticky="w",
-                         padx=10, pady=2)
+                         padx=(0, 14), pady=2)
             canv.configure(scrollregion=canv.bbox("all"))
-        canv.bind("<Configure>", lambda e: _relayout_vis())
 
-        # 鼠标滚轮支持（对话框关闭时解绑，避免残留绑定报到已销毁的 Canvas）
-        def _wheel(e):
-            try:
-                canv.yview_scroll(int(-1 * (e.delta / 120)), "units")
-            except tk.TclError:
-                pass
-
-        def _cleanup():
-            try:
-                dlg.unbind_all("<MouseWheel>")
-            except tk.TclError:
-                pass
-
-        canv.bind("<Enter>", lambda e: dlg.bind_all("<MouseWheel>", _wheel))
-        canv.bind("<Leave>", lambda e: _cleanup())
+        canv.bind("<Configure>", lambda e: _relayout_vis_cols())
 
         bf = ttk.Frame(frm)
         bf.grid(row=4, column=0, columnspan=2, pady=(8, 0), sticky="ew")

@@ -4,7 +4,7 @@ r"""
 LOG数据扫描工具 · GUI 版（Python 标准库 tkinter）
 
 功能：
-  - 选择扫描路径（文件夹），可指定文件类型过滤（如 *.csv，留空=全部）
+  - 选择扫描路径（文件夹），扫描目录下全部文件（无后缀过滤）
   - 开始 / 暂停 / 停止 控制扫描；【开始】后进入持续监控，按界面设定的「轮询间隔」（默认 20 秒）
     自动扫描一轮，状态栏显示距下次扫描的倒计时，直到点【停止】才退出
   - 实时显示：当前处理的文件路径、已处理文件列表、扫描进度、统计数字
@@ -288,12 +288,13 @@ def _safe_scandir(root, timeout=15.0):
     return res["it"]
 
 
-def iter_files(root, ext_filter, retries=0, stop_event=None):
-    """递归遍历 root 下所有文件，yield (path, DirEntry)。
-    ext_filter: 小写后缀集合，如 {'.csv'}；空集合表示全部。
+def iter_files(root, retries=0, stop_event=None):
+    """枚举 root 下所有【文件】并 yield (path, DirEntry)。
+    约定：root 为结构固定的最底层目录（如 {设备}/CPU1/BACKUP_YYYYMM），其中只含文件、
+          无子目录需要递归。因此仅用 DirEntry 缓存的 is_file() 判定，
+          不再做目录判定 / 递归 / 二次网络 stat，单个 2000 条目的网络目录也不会触发上千次往返。
     顶层目录若无法访问，抛出异常由调用方上报（不再静默吞掉）。
-    retries: 仅对【最顶层】scandir 生效的重试次数（应对网络盘启动瞬间未就绪）；
-             递归进入的子目录失败一律 continue，不影响整体。
+    retries: 仅对【最顶层】scandir 生效的重试次数（应对网络盘启动瞬间未就绪）。
     stop_event: 传入则遍历每个条目前检查，命中即退出（使「停止」在枚举阶段也能及时响应）。
     """
     # 顶层 scandir 失败要抛出（或重试），让界面能显示错误，而不是静默变成 0 候选
@@ -302,7 +303,11 @@ def iter_files(root, ext_filter, retries=0, stop_event=None):
         try:
             it = _safe_scandir(root)
             break
-        except OSError:
+        except OSError as e:
+            # 目录根本不存在（路径拼错/未生成）属确定失败：首次即放弃，不重试，避免 3×15s 空等
+            msg = str(e)
+            if getattr(e, "winerror", None) == 3 or "系统找不到" in msg or "No such file" in msg:
+                raise
             if attempt >= retries:
                 raise
             time.sleep(1.0)  # 网络盘偶尔未就绪，稍等再试
@@ -310,32 +315,14 @@ def iter_files(root, ext_filter, retries=0, stop_event=None):
     with it:
         for entry in it:
             if stop_event is not None and stop_event.is_set():
-                return  # 用户点了停止：各层逐层冒泡退出，结束枚举
-            is_dir = is_file = False
-            # 1) 先用 DirEntry 缓存判定（性能最优）
-            try:
-                is_dir = entry.is_dir(follow_symlinks=False)
-            except OSError:
-                is_dir = False
-            # 2) SMB 网络盘上 DirEntry.is_dir 可能【不抛异常却返回 False】把真实目录误判掉，
-            #    导致整棵子树被静默跳过（这正是此前「顶层能看到设备目录、递归进去却 0 文件」的根因）。
-            #    因此只要 DirEntry 说不是目录，必须用 os.path.isdir 独立 stat 二次确认；
-            #    该 stat 在网络盘上可能挂起，用 _safe_stat 加超时保护，避免永久卡死。
-            if not is_dir:
-                is_dir = _safe_stat(entry.path, os.path.isdir)
-            if is_dir:
-                yield from iter_files(entry.path, ext_filter, stop_event=stop_event)  # 子目录不重试
-                continue
-            # 文件判定同理：DirEntry 不可靠时退 os.path.isfile 兜底（同样带超时）
+                return  # 用户点了停止：结束枚举
+            # 仅用 DirEntry 缓存判定（性能最优，无额外网络 stat / 无递归）
             try:
                 is_file = entry.is_file(follow_symlinks=False)
             except OSError:
                 is_file = False
-            if not is_file:
-                is_file = _safe_stat(entry.path, os.path.isfile)
             if is_file:
-                if not ext_filter or entry.name.lower().endswith(tuple(ext_filter)):
-                    yield entry.path, entry
+                yield entry.path, entry
 
 
 # -------------------------- 增量判定（纯文件名去重） --------------------------
@@ -382,27 +369,24 @@ def ym_range(start_year, start_month):
 
 
 def discover_backup_targets(root, months, device_list, lines=None):
-    """在 root（如 Z:/）下发现形如 {设备}/{CPU_SUBDIR}/BACKUP_YYYYMM 的目录。
-    months: 'YYYYMM' 列表；返回存在的目标目录绝对路径列表（按设备+月份排序）。
-    若 root 不是设备根（其下没有 {CPU_SUBDIR}），返回空列表——此时调用方回退到通用递归扫描。
+    """根据持久化的设备清单直接拼接形如 {设备}/{CPU_SUBDIR}/BACKUP_YYYYMM 的目录路径。
+    不再做每轮 isdir 存在性探测（之前的 D + D×M 次网络往返全部省掉）；目录是否真实存在、
+    能否扫描，交由下游 iter_files 的 scandir 超时/重试与「已处理跳过」逻辑处理。
+    months: 'YYYYMM' 列表；返回目标目录绝对路径列表（按设备+月份排序）。
     device_list: 设备号清单（非空，首次运行已由扫描路径嗅探并持久化到配置）。直接用清单里的设备号
-        逐个拼 {dev}/CPU_SUBDIR/BACKUP_YYYYMM 并对存在性 isdir，不做每轮 listdir 自动发现，
-        省去每轮 D 次顶层 isdir（选产线时也不必为“发现历史设备”而枚举全历史目录）。
-    lines: 可选产线筛选集合（如 {'E','D'}）。提供时对设备号先按 classify_line 前缀过滤再拼路径，
-        把非目标产线的设备整月目录在探测前就剔除，省去 SMB 上无谓的 isdir 往返。None/空 = 不过滤。"""
+        逐个拼路径，不做 listdir 自动发现、不做 isdir 探测，纯本地拼接。
+    lines: 可选产线筛选集合（如 {'E','D'}）。提供时对设备号先按 classify_line 前缀过滤再拼路径。
+        None/空 = 不过滤。"""
     targets = []
-    if not os.path.isdir(root) or not device_list:
+    if not root or not device_list:
         return targets
     for dev in sorted(device_list):
         if lines and analysis.classify_line(dev) not in lines:
-            continue  # 非目标产线设备：拼接前剔除，省去 isdir 往返
+            continue  # 非目标产线设备：拼接前剔除
         dev_path = os.path.join(root, dev)
-        if not os.path.isdir(dev_path):
-            continue
         for ym in months:
             cand = os.path.join(dev_path, CPU_SUBDIR, "BACKUP_" + ym)
-            if os.path.isdir(cand):
-                targets.append(cand)
+            targets.append(cand)
     return targets
 
 
@@ -529,25 +513,9 @@ class ScannerApp:
                                          font=("Microsoft YaHei", 12, "bold"))
         self.lbl_title_status.pack(side="left")
 
-        # --- 扫描设置（可折叠：小箭头展开/收起，默认展开）---
-        self.frm_scan_box = ttk.Frame(root, padding=(0, 0))
-        self.frm_scan_box.grid(row=1, column=0, sticky="ew", padx=8, pady=(8, 4))
-        self.frm_scan_box.columnconfigure(0, weight=1)
-
-        # 折叠开关行（箭头 + 标题，常驻可见，点击整行展开/收起）
-        scan_head = ttk.Frame(self.frm_scan_box)
-        scan_head.pack(fill="x")
-        self.scan_expanded = tk.BooleanVar(value=True)
-        self.btn_scan_toggle = ttk.Button(
-            scan_head, text="▼ 扫描设置",
-            command=self._toggle_scan_panel)
-        self.btn_scan_toggle.pack(side="left")
-
-        # 内容区（默认展开，保留 LabelFrame 边框分组）
-        frm_settings = ttk.LabelFrame(self.frm_scan_box, text="扫描设置",
-                                      padding=(12, 6, 12, 10))
-        frm_settings.pack(fill="x", pady=(4, 0))
-        frm_settings.columnconfigure(0, weight=1)
+        # --- 扫描设置（可折叠：点整行展开/收起，默认展开）---
+        self.frm_scan_box, _, frm_settings = self._make_collapsible(
+            root, "扫描设置", 1, expanded=True, pady=(8, 4))
         self.frm_scan_inner = frm_settings
 
         # 路径选择 + 文件类型过滤（同一行：扫描路径 → 打开路径 → 文件类型）
@@ -562,11 +530,6 @@ class ScannerApp:
         self.btn_browse.grid(row=0, column=2, sticky="w", padx=(0, 6))
         self.btn_open_path = ttk.Button(frm_path, text="打开路径", command=self._open_scan_path)
         self.btn_open_path.grid(row=0, column=3, sticky="w", padx=(0, 10))
-        ttk.Label(frm_path, text="文件类型：").grid(row=0, column=4, sticky="w")
-        self.ext_var = tk.StringVar(value="*.csv")
-        self.entry_ext = ttk.Entry(frm_path, textvariable=self.ext_var, width=16)
-        self.entry_ext.grid(row=0, column=5, sticky="w", padx=(4, 4))
-        ttk.Label(frm_path, text="（留空=全部）").grid(row=0, column=6, sticky="w")
 
         # 首次搜索起始月份（含）
         frm_ym = ttk.Frame(frm_settings, padding=(2, 2, 2, 6))
@@ -640,43 +603,23 @@ class ScannerApp:
         self.spin_workers = ttk.Spinbox(frm_workers, from_=1, to=32, width=5,
                                         textvariable=self.workers_var)
         self.spin_workers.pack(side="left", padx=(4, 2))
-        ttk.Label(frm_workers,
-                  text="个（计算指标并行线程数，1=不并行；网络盘可适当调大）").pack(side="left")
         self.workers_var.trace_add("write", self._on_workers_change)
 
-        # --- 月度CSV导出设置（可折叠：小箭头展开/收起）---
-        self.frm_auto_box = ttk.Frame(root, padding=(0, 0))
-        self.frm_auto_box.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 4))
-        self.frm_auto_box.columnconfigure(0, weight=1)
-
-        # 折叠开关行（箭头 + 标题 + 启用/间隔，常驻可见，无需展开即可操作与查看状态）
-        auto_head = ttk.Frame(self.frm_auto_box)
-        auto_head.pack(fill="x")
-        self.auto_expanded = tk.BooleanVar(value=False)
-        self.btn_auto_toggle = ttk.Button(
-            auto_head, text="▶ 月度CSV导出设置",
-            command=self._toggle_auto_panel)
-        self.btn_auto_toggle.pack(side="left")
+        # --- 月度导出设置（可折叠：点整行展开/收起，默认收起）---
+        self.frm_auto_box, auto_head_right, frm_auto = self._make_collapsible(
+            root, "月度导出设置", 2, expanded=False, pady=(4, 4))
         # 启用复选框（直接可见，勾选即开始 / 取消即停止）
         self.chk_auto = ttk.Checkbutton(
-            auto_head, text="启用自动导出", variable=self.auto_enabled_var)
+            auto_head_right, text="启用自动导出", variable=self.auto_enabled_var)
         self.chk_auto.pack(side="left", padx=(12, 0))
         self.auto_enabled_var.trace_add("write", lambda *a: self._on_auto_enabled_toggle())
-        ttk.Label(auto_head, text="间隔：").pack(side="left", padx=(12, 2))
+        ttk.Label(auto_head_right, text="间隔：").pack(side="left", padx=(12, 2))
         self.entry_auto_interval = ttk.Entry(
-            auto_head, textvariable=self.auto_interval_var, width=8)
+            auto_head_right, textvariable=self.auto_interval_var, width=8)
         self.entry_auto_interval.pack(side="left", padx=(0, 2))
         self.auto_interval_var.trace_add(
             "write", lambda *a: self._save_auto_config(silent=True))
-        ttk.Label(auto_head, text="分钟").pack(side="left")
-
-        # 内容区（默认隐藏，含目录 / 导出列等详细设置）；用 LabelFrame 保留分组边框，
-        # 并给实际标题避免空标题槽留白
-        frm_auto = ttk.LabelFrame(self.frm_auto_box, text="导出目录与列",
-                                  padding=(12, 6, 12, 10))
-        frm_auto.pack(fill="x", pady=(4, 0))
-        frm_auto.columnconfigure(1, weight=1)
-        frm_auto.pack_forget()
+        ttk.Label(auto_head_right, text="分钟").pack(side="left")
         self.frm_auto = frm_auto
 
         auto_row1 = ttk.Frame(frm_auto, padding=(2, 2, 2, 4))
@@ -862,14 +805,17 @@ class ScannerApp:
         self.total_var.set(str(len(self.processed_set)))
         self.last_var.set(self._fmt_time(self.state.get("last_scan_time", 0)))
         devs = self.state.get("device_list") or []
-        dev_txt = " · 设备清单%d台" % len(devs)
         line = self.state.get("scan_lines", [])
-        line_txt = (" · 产线%s" % "/".join(line)) if line else ""
+        # 标题栏设备数：产线写前面，只显示选定设备台数；未选产线时退回显示全量设备清单
+        if line:
+            devs = [d for d in devs if analysis.classify_line(d) in line]
+        dev_txt = (" · 选定设备%d台" % len(devs)) if line else (" · 设备清单%d台" % len(self.state.get("device_list") or []))
+        line_txt = ("产线%s · " % "/".join(line)) if line else ""
         # 月初窗口内存在「未确认」设备时会顺带扫上月，标题栏如实反映，避免“仅当前月”误导
         _cur_ym = "%04d%02d" % (time.localtime().tm_year, time.localtime().tm_mon)
-        self.mode_var.set("监控中：每轮当前月"
+        self.mode_var.set("监控中：本月"
                           + ("（含上月兜底·逐设备确认）" if self._need_prev_scan(_cur_ym) else "")
-                          + dev_txt + line_txt)
+                          + line_txt + dev_txt)
         if self.thread and self.thread.is_alive():
             self._set_title(self.mode_var.get(), "run")
         else:
@@ -934,10 +880,10 @@ class ScannerApp:
             return 4
 
     def _set_path_settings_enabled(self, enabled):
-        """运行中锁定「开始才生效」的控件（路径/浏览/文件类型/起始年月）。
+        """运行中锁定「开始才生效」的控件（路径/浏览/起始年月）。
         产线、算指标、轮询、设备清单、导出区均即时生效，保持可用。"""
         state = "normal" if enabled else "disabled"
-        for w in (self.entry_path, self.btn_browse, self.btn_open_path, self.entry_ext,
+        for w in (self.entry_path, self.btn_browse, self.btn_open_path,
                   self.spin_year, self.spin_month):
             w.config(state=state)
 
@@ -1020,11 +966,14 @@ class ScannerApp:
         line = self.state.get("scan_lines", [])
         line_txt = (" · 产线%s" % "/".join(line)) if line else ""
         devs = self.state.get("device_list") or []
-        dev_txt = " · 设备清单%d台" % len(devs)
+        # 标题栏设备数按当前产线筛选显示实际要扫的设备，而非嗅探全量
+        if line:
+            devs = [d for d in devs if analysis.classify_line(d) in line]
+        dev_txt = (" · 选定设备%d台" % len(devs)) if line else (" · 设备清单%d台" % len(self.state.get("device_list") or []))
         _cur_ym = "%04d%02d" % (time.localtime().tm_year, time.localtime().tm_mon)
-        self.mode_var.set("监控中：每轮当前月"
+        self.mode_var.set("监控中：本月"
                           + ("（含上月兜底·逐设备确认）" if self._need_prev_scan(_cur_ym) else "")
-                          + dev_txt + line_txt)
+                          + line_txt + dev_txt)
         if self.thread and self.thread.is_alive():
             return
         self.stop_event.clear()
@@ -1189,20 +1138,6 @@ class ScannerApp:
 
     # ---------- 后台监控（持续循环：每 POLL_INTERVAL 扫描一轮，直到点停止） ----------
     def _run(self, root_path, backfill=False):
-        ext_raw = self.ext_var.get().strip()
-        ext_filter = set()
-        if ext_raw:
-            for x in ext_raw.replace(";", " ").split():
-                t = x.strip().lower()
-                if not t:
-                    continue
-                # 接受 *.ext / .ext / ext 三种写法，统一存 ".ext"
-                if t.startswith("*."):
-                    t = t[1:]           # "* . csv" -> ".csv"
-                elif not t.startswith("."):
-                    t = "." + t         # "csv" -> ".csv"
-                ext_filter.add(t)
-
         # 目录发现统一用 device_list 直接拼路径（见 discover_backup_targets），不做每轮 listdir 自动发现；
         # 区别仅在 months 集合：正常监控仅当前月（窗口内未确认设备顺带上月），回填则起始月→当前月全量。
         # months 在循环内每轮按当前月重算，从而跨月时自动切到新月份目录，无需重启（设备清单需手动嗅探更新）。
@@ -1231,15 +1166,20 @@ class ScannerApp:
                     pm = prev_ym(cur_ym)
                     if pm not in months:
                         months.append(pm)
-            # 当前月 + 待确认的上月集合：统计框中这些月份的文件夹【总是列出】（含新增 0）
-            current_months = {cur_ym}
-            if need_prev:
-                current_months.add(prev_ym(cur_ym))
+            # 统计框【总是列出】的月份集合：正常监控=当前月+待确认上月；历史回填=全部回填月份。
+            # 这样回填的各历史文件夹都会稳定显示累计/新增，而非仅在有新增时闪现。
+            if backfill:
+                current_months = set(months)
+            else:
+                current_months = {cur_ym}
+                if need_prev:
+                    current_months.add(prev_ym(cur_ym))
             # 设备清单必非空（首次运行已嗅探持久化）：直接用清单里的设备号拼路径，
             # 不做每轮 listdir 自动发现，省去每轮 D 次顶层 isdir；选产线时也不必再枚举全历史目录。
             raw_targets = discover_backup_targets(
-                root_path, months, device_list=device_list, lines=lines)  # 已识别到设备备份结构（已按产线过滤）
-            structure_ok = bool(raw_targets)
+                root_path, months, device_list=device_list, lines=lines)  # 直接按设备清单拼接目录（不探测存在性）
+            # structure_ok：设备备份结构是否可用（基于设备清单是否非空），不再依赖 isdir 探测结果
+            structure_ok = bool(device_list)
             targets = raw_targets
             device_mode = bool(targets)
             # 逐设备剔除「已确认」设备的上月目录：本月目录总是保留，上月目录仅保留
@@ -1280,7 +1220,7 @@ class ScannerApp:
             # 有匹配目录时只扫命中的设备目录；无匹配时本轮跳过扫描（不回退递归全量扫描）
             if targets:
                 scanned, total, done, discovery_error = self._scan_cycle(
-                    targets, root_path, ext_filter, ext_raw, current_months)
+                    targets, root_path, current_months)
             else:
                 scanned, total, done, discovery_error = 0, 0, 0, None
                 # 跳过扫描时也刷新统计面板，避免残留上一产线/上一轮的数据
@@ -1341,7 +1281,7 @@ class ScannerApp:
         self.q.put(("status_color", "#c80" if not backfill else "#0a0"))
         self.q.put(("finished", 1 if backfill else 0))
 
-    def _scan_cycle(self, targets, root_path, ext_filter, ext_raw, current_months=None):
+    def _scan_cycle(self, targets, root_path, current_months=None):
         """执行【一轮】扫描：发现候选 + 逐个处理。
         targets: 设备备份目录列表（如 [{设备}/CPU1/BACKUP_YYYYMM, ...]）；为 None 时回退为
                  对整个 root_path 递归全量扫描（通用模式）。
@@ -1355,9 +1295,11 @@ class ScannerApp:
         # 扫描范围：targets 为目录列表时逐个目录扫；为 None 时递归整个 root_path
         scan_roots = targets if targets is not None else [root_path]
         for scan_root in scan_roots:
+            # 目录存在性不再逐目录探测（直接按设备清单拼接路径）；不存在的目录在 iter_files
+            # 内部 scandir 重试失败后会被捕获，这里仅记录日志并跳过本轮该目录的枚举。
             self.q.put(("current", "🔍 开始枚举: " + scan_root))
             try:
-                for fpath, entry in iter_files(scan_root, ext_filter, retries=3,
+                for fpath, entry in iter_files(scan_root, retries=1,
                                                 stop_event=self.stop_event):
                     if self.stop_event.is_set():
                         break
@@ -1370,16 +1312,17 @@ class ScannerApp:
                         last_folder = folder
                     if scanned % 500 == 0:
                         self.q.put(("status", "发现中… 已枚举 %d 个文件" % scanned))
-                    try:
-                        st = entry.stat(follow_symlinks=False)
-                    except OSError:
-                        continue
+                    # 方案A：仅凭文件名去重，不再调用 entry.stat()（省去每个文件的额外网络往返）
+                    # candidates 改为单元素元组 (fpath,)，size/mtime 不再获取
                     if is_candidate(fpath, self.processed_set):
-                        candidates.append((fpath, st.st_size, st.st_mtime))
+                        candidates.append((fpath,))
             except Exception as e:
                 discovery_error = e
-                self.q.put(("status", "发现阶段出错：%s" % e))
-                self.q.put(("status_color", "#c00"))
+                if getattr(e, "winerror", None) == 3 or "系统找不到" in str(e) or "No such file" in str(e):
+                    self.q.put(("log", "目录不存在，本轮跳过：%s" % scan_root))
+                else:
+                    self.q.put(("log", "发现阶段出错：%s" % e))
+                    self.q.put(("status_color", "#c00"))
             if self.stop_event.is_set():
                 break
 
@@ -1391,9 +1334,12 @@ class ScannerApp:
 
         total = len(candidates)
         self.q.put(("cand", total))
-        if discovery_error:
+        # 目录不存在的失败已在循环内逐目录记过“目录不存在，本轮跳过”，这里不再重复汇总；
+        # 仅当存在“非目录不存在”的异常时才汇总报出（保留真正错误的可见性）。
+        if discovery_error and not (getattr(discovery_error, "winerror", None) == 3
+                                    or "系统找不到" in str(discovery_error)
+                                    or "No such file" in str(discovery_error)):
             self.q.put(("log", "✘ 发现阶段失败：%s" % discovery_error))
-            self.q.put(("log", "  请检查路径是否可访问、网络盘是否连接、权限是否足够。"))
         else:
             self.q.put(("log", "已枚举 %d 个文件，新增候选 %d 个。" % (scanned, total)))
             self.q.put(("status", "处理中（候选 %d 个）" % total))
@@ -1401,7 +1347,7 @@ class ScannerApp:
         # 逐个处理候选文件（只统计到文件夹粒度，不逐个显示）
         done = 0
         last_folder = None
-        for fpath, size, mtime in candidates:
+        for (fpath,) in candidates:
             if self.stop_event.is_set():
                 break
             # 暂停处理
@@ -1420,7 +1366,7 @@ class ScannerApp:
                 ts = time.strftime("%Y-%m-%d %H:%M:%S")
                 self.processed_set.add(fpath)                 # 内存集合：O(1) 去重
                 self.folder_counts[folder] = self.folder_counts.get(folder, 0) + 1  # 同步累计计数
-                self.pending_rows.append((fpath, ts, size, mtime))  # 待落盘
+                self.pending_rows.append((fpath, ts, None, None))  # 待落盘（方案A：size/mtime 不取，留 NULL）
                 done += 1
                 new_per_folder[folder] = new_per_folder.get(folder, 0) + 1
                 self.q.put(("done_count", done))
@@ -1557,28 +1503,59 @@ class ScannerApp:
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
-    # ---------- 自动导出（按月 CSV） ----------
-    def _toggle_auto_panel(self):
-        """点击小箭头展开/收起月度CSV导出设置。"""
-        if self.auto_expanded.get():
-            self.frm_auto.pack_forget()
-            self.auto_expanded.set(False)
-            self.btn_auto_toggle.config(text="▶ 月度CSV导出设置")
-        else:
-            self.frm_auto.pack(fill="x", pady=(4, 0))
-            self.auto_expanded.set(True)
-            self.btn_auto_toggle.config(text="▼ 月度CSV导出设置")
+    # ---------- 通用可折叠面板（方案 A：一次定义，点箭头按钮展开/收起） ----------
+    def _make_collapsible(self, parent, title, row, expanded=True, pady=(4, 4)):
+        """创建一个点击箭头按钮展开/收起的折叠区块。
 
-    def _toggle_scan_panel(self):
-        """点击小箭头展开/收起扫描设置（默认展开）。"""
-        if self.scan_expanded.get():
-            self.frm_scan_inner.pack_forget()
-            self.scan_expanded.set(False)
-            self.btn_scan_toggle.config(text="▶ 扫描设置")
-        else:
-            self.frm_scan_inner.pack(fill="x", pady=(4, 0))
-            self.scan_expanded.set(True)
-            self.btn_scan_toggle.config(text="▼ 扫描设置")
+        布局：
+          box
+           ├─ head      顶部标题行：箭头按钮 + 标题 + 右侧常驻控件区 head_right（始终可见）
+           └─ inner     内容 LabelFrame（展开显示 / 收起隐藏）
+
+        返回 (box, head_right, inner)：
+          - box        外层容器（已 grid 到 parent 的 row）
+          - head_right 标题栏右侧常驻区域（始终可见），供调用方追加常驻控件（如启用/间隔）
+          - inner      放内容的 LabelFrame（默认已展开或收起）
+        """
+        box = ttk.Frame(parent, padding=(0, 0))
+        box.grid(row=row, column=0, sticky="ew", padx=8, pady=pady)
+        box.columnconfigure(0, weight=1)
+
+        expanded_var = tk.BooleanVar(value=expanded)
+
+        # 顶部标题行：箭头按钮（加粗样式）+ 标题 + 右侧常驻控件区，始终可见
+        head = ttk.Frame(box)
+        head.pack(fill="x")
+        _collapse_style = ttk.Style()
+        _collapse_style.configure("CollapseTitle.TButton",
+                                  font=("Microsoft YaHei", 9, "bold"), anchor="w")
+        btn = ttk.Button(head, text=("▼ " if expanded else "▶ ") + title,
+                         style="CollapseTitle.TButton")
+        btn.pack(side="left", fill="x", expand=True)
+        head_right = ttk.Frame(head)
+        head_right.pack(side="left")
+
+        inner = ttk.LabelFrame(box, text=title, padding=(12, 6, 12, 10))
+        inner.pack(fill="x", pady=(4, 0))
+        inner.columnconfigure(0, weight=1)
+
+        def _toggle():
+            if expanded_var.get():
+                inner.pack_forget()
+                expanded_var.set(False)
+                btn.config(text="▶ " + title)
+            else:
+                inner.pack(fill="x", pady=(4, 0))
+                expanded_var.set(True)
+                btn.config(text="▼ " + title)
+
+        btn.config(command=_toggle)
+
+        if not expanded:
+            inner.pack_forget()
+            btn.config(text="▶ " + title)
+
+        return box, head_right, inner
 
     def _auto_column_labels(self):
         """自动导出可选列（与手动导出相互独立，选择持久化于 scan_state.ini 的 csv_auto_cols，不单独落 json）。"""
@@ -2479,18 +2456,18 @@ class DeviceListDialog(tk.Toplevel):
     def _build(self):
         ttk.Label(
             self,
-            text="设备号清单（每行一个；为空时需点「从扫描路径嗅探」手动填充）").pack(
+            text="设备清单（用逗号分隔，如 A01,B02,C03；为空时需点「从扫描路径嗅探」填充）").pack(
             anchor="w", padx=10, pady=(8, 2))
         frm = ttk.Frame(self)
         frm.pack(fill="both", expand=True, padx=10, pady=2)
-        self.text = tk.Text(frm, height=18)
+        self.text = tk.Text(frm, height=10, wrap="word", font=("Microsoft YaHei", 9))
         self.text.pack(side="left", fill="both", expand=True)
         sb = ttk.Scrollbar(frm, command=self.text.yview)
         sb.pack(side="right", fill="y")
         self.text.config(yscrollcommand=sb.set)
         cur = self.app.state.get("device_list") or []
         if cur:
-            self.text.insert("1.0", "\n".join(cur))
+            self.text.insert("1.0", ", ".join(cur))
 
         bf = ttk.Frame(self)
         bf.pack(fill="x", padx=10, pady=6)
@@ -2502,7 +2479,7 @@ class DeviceListDialog(tk.Toplevel):
         ttk.Button(af, text="确定", command=self._on_ok).pack(side="right", padx=4)
         ttk.Button(af, text="取消", command=self.destroy).pack(side="right", padx=4)
 
-        self.status = ttk.Label(self, text="", foreground="#1a73e8", wraplength=320)
+        self.status = ttk.Label(self, text="", foreground="#1a73e8", wraplength=440)
         self.status.pack(anchor="w", padx=10, pady=(2, 6))
 
     def _sniff(self):
@@ -2517,7 +2494,7 @@ class DeviceListDialog(tk.Toplevel):
             self.status.config(text="嗅探失败：%s" % e)
             return
         self.text.delete("1.0", "end")
-        self.text.insert("1.0", "\n".join(devs))
+        self.text.insert("1.0", ", ".join(devs))
         self.status.config(text="已从扫描路径嗅探到 %d 个设备目录。" % len(devs))
 
     def _clear(self):
@@ -2526,11 +2503,14 @@ class DeviceListDialog(tk.Toplevel):
 
     def _on_ok(self):
         seen, devs = set(), []
-        for line in self.text.get("1.0", "end").splitlines():
-            d = line.strip()
+        raw = self.text.get("1.0", "end").strip()
+        # 兼容逗号、空格、换行多种分隔，统一按逗号/空白拆分
+        for tok in raw.replace("\n", ",").replace("，", ",").replace(" ", ",").split(","):
+            d = tok.strip()
             if d and d not in seen:
                 seen.add(d)
                 devs.append(d)
+        devs.sort()
         self.app.state["device_list"] = devs
         self.app._save_config()
         self.app._refresh_from_state()
