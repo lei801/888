@@ -49,7 +49,6 @@ def _build_columns():
         ("设备", "p.device"),
         ("月份", "p.ym"),
         ("路径", "p.path"),
-        ("大小", "p.size"),
         ("处理时间", "p.ts"),
     ]
     metric = [(d[1], d[0]) for d in analysis.column_defs()]  # (label, expr)

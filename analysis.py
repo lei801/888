@@ -16,13 +16,11 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 import csv
 import io
 import json
 import functools
 import sqlite3
-import shutil
 import datetime
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -376,9 +374,12 @@ METRICS["std_outer"] = {
     "label": "外层剥离值方差", "type": "REAL", "column": "std_outer",
     "compute": _make_stat_getter("std_outer", None),
 }
-
-# 已废弃的旧指标列（口径已被 PQ 版取代），ensure_tables 里尝试 DROP 清理
-_OBSOLETE_COLUMNS = ["col2_count", "cnt_576", "cnt_586", "cnt_587"]
+# 文件大小（字节）：原 processed.size 列，现并入 metrics 宽表。
+# 仅在「计算指标」阶段取值（os.path.getsize 一次网络 stat），扫描阶段不取，避免性能回退。
+METRICS["size"] = {
+    "label": "大小", "type": "INTEGER", "column": "size",
+    "compute": lambda path: os.path.getsize(path),
+}
 
 
 # ----------------------------------------------------------------------------
@@ -386,10 +387,10 @@ _OBSOLETE_COLUMNS = ["col2_count", "cnt_576", "cnt_586", "cnt_587"]
 # ----------------------------------------------------------------------------
 
 def ensure_tables(conn, lock=None):
-    """建合并后的指标宽表 metrics（path 主键 + 各指标列 + run_at）；
-    并把旧 schema（results + met_* 多表）一次性合并迁入 metrics，随后删除旧表。
+    """建合并后的指标宽表 metrics（id 主键 + path + 各指标列 + run_at）。
 
-    相比旧的多表结构，path / run_at 只存一份，库体显著缩小。
+    数据库会整体重置，故只做干净建表，不做任何 schema 迁移 / 兼容补列。
+    ym / device 属于 processed 表，此处不建（避免索引指向不存在列）。
     """
     cm = lock if lock is not None else _nullcontext()
     with cm:
@@ -400,54 +401,6 @@ def ensure_tables(conn, lock=None):
                 f"id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, "
                 f"run_at TEXT, {cols})"
             )
-            # 旧库兼容：若 metrics 已存在但缺 METRICS 中新增的列，自动 ALTER 补列，
-            # 使「在 METRICS 注册表加一项指标」即可生效，无需手动迁移数据库。
-            _cur_cols = {r[1] for r in conn.execute("PRAGMA table_info(metrics)")}
-            for _m in METRICS.values():
-                if _m["column"] not in _cur_cols:
-                    conn.execute(
-                        f"ALTER TABLE metrics ADD COLUMN {_m['column']} {_m['type']}"
-                    )
-            _migrate_legacy_to_wide(conn)
-            _drop_obsolete_columns(conn, _cur_cols)
-
-
-def _drop_obsolete_columns(conn, cur_cols):
-    """清理口径已废弃的旧指标列（SQLite < 3.35 不支持 DROP COLUMN 时静默跳过，
-    留作不可见孤儿列，不影响功能）。"""
-    for col in _OBSOLETE_COLUMNS:
-        if col in cur_cols:
-            try:
-                conn.execute(f"ALTER TABLE metrics DROP COLUMN {col}")
-            except sqlite3.Error:
-                pass
-
-
-def _migrate_legacy_to_wide(conn):
-    """旧 schema（results 表 + met_* 表）合并进 metrics 宽表；迁移完成后删除旧表。"""
-    if not list(conn.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='results'")):
-        return
-    # 从 results 搬基础列（path/run_at；col2_count 已废弃不再迁移）
-    conn.execute(
-        "INSERT OR IGNORE INTO metrics (path, run_at) "
-        "SELECT path, run_at FROM results"
-    )
-    # 各 met_* 表 UPDATE 对应列
-    for key, m in METRICS.items():
-        mt = f"met_{key}"
-        if not list(conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (mt,))):
-            continue
-        col = m["column"]
-        conn.execute(
-            f"UPDATE metrics SET {col}=(SELECT value FROM {mt} x WHERE x.path=metrics.path) "
-            f"WHERE path IN (SELECT path FROM {mt})"
-        )
-    # 删除旧表
-    conn.execute("DROP TABLE IF EXISTS results")
-    for key in METRICS:
-        conn.execute(f"DROP TABLE IF EXISTS met_{key}")
 
 
 def compute_all(path):
@@ -696,110 +649,3 @@ def summarize(conn):
         ym = ym or "(空)"
         lines.append(f"  {ym}: 文件 {cnt}")
     return "\n".join(lines)
-
-
-# ----------------------------------------------------------------------------
-# schema 迁移：旧库（processed/metrics 均为 path TEXT 主键）→ INTEGER rowid 主键。
-# 带自动备份、用 PRAGMA user_version 标记（幂等，仅跑一次）。
-# ----------------------------------------------------------------------------
-
-_MIGRATE_VERSION = 1
-
-
-def _backup_before_migration(conn):
-    """迁移前安全备份主库（WAL 先 checkpoint，再复制主文件）。返回备份路径或 None。"""
-    try:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    except sqlite3.Error:
-        pass
-    try:
-        row = conn.execute("PRAGMA database_list").fetchone()
-        path = row[2] if row else None
-    except sqlite3.Error:
-        return None
-    if not path:
-        return None
-    bak = path + ".rowid_migrate_bak"
-    try:
-        if os.path.exists(bak):
-            os.remove(bak)
-        shutil.copy(path, bak)
-        return bak
-    except OSError:
-        return None
-
-
-def _create_csv_indexes(conn):
-    """建加速导出的索引（按 ym / device 筛选；指针为 8 字节整数，百万级也仅几十 MB）。
-
-    注：原 idx_processed_ts / idx_metrics_runat 已移除——增量导出改为按日期推导变动窗口
-    （当前月 + 仍在带扫的上月），不再依赖 ts / run_at 探测，故这两索引无用且占用约 64MB。
-    """
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_ym ON processed(ym)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_processed_device ON processed(device)")
-
-
-def migrate_to_rowid(conn, lock=None):
-    """把旧 schema（processed/metrics 均为 path TEXT 主键）一次性迁移为 INTEGER rowid 主键。
-
-    - 自动备份（scan_state.db.rowid_migrate_bak）后再改结构；
-    - 用 PRAGMA user_version 标记，仅跑一次（幂等）；
-    - 新库（已是 rowid 结构）只建索引并标记，不重建。
-
-    迁移做法：旧表 RENAME 为 *_old → 建新结构表（复用 ensure_tables 的列定义）→ 数据拷入
-    → 删 *_old → 建索引。全程在锁内、单事务中完成。
-    """
-    cm = lock if lock is not None else _nullcontext()
-    with cm:
-        try:
-            cur_ver = conn.execute("PRAGMA user_version").fetchone()[0]
-        except sqlite3.Error:
-            cur_ver = 0
-        if cur_ver >= _MIGRATE_VERSION:
-            with conn:                         # 确保 CREATE INDEX 提交
-                _create_csv_indexes(conn)      # 已迁移：确保索引存在即可
-            return
-        # 是否已为新结构（可能 user_version 未标记的新装库）
-        pcols = {r[1] for r in conn.execute("PRAGMA table_info(processed)")}
-        if "id" in pcols:
-            _create_csv_indexes(conn)
-            try:
-                with conn:
-                    conn.execute(f"PRAGMA user_version={_MIGRATE_VERSION}")
-            except sqlite3.Error:
-                pass
-            return
-        # ↓ 真正迁移（旧库：path TEXT 主键）
-        bak = _backup_before_migration(conn)
-        if bak:
-            print(f"[migrate] 已备份旧库到 {bak}", file=sys.stderr)
-        with conn:
-            # processed：Rename → 建新结构 → 拷数据 → 删旧
-            conn.execute("ALTER TABLE processed RENAME TO processed_old")
-            conn.execute(
-                "CREATE TABLE processed ("
-                "id INTEGER PRIMARY KEY, path TEXT UNIQUE NOT NULL, "
-                "ts TEXT, size INTEGER, mtime REAL, device TEXT, ym TEXT)"
-            )
-            conn.execute(
-                "INSERT INTO processed (path, ts, size, mtime, device, ym) "
-                "SELECT path, ts, size, mtime, device, ym FROM processed_old"
-            )
-            conn.execute("DROP TABLE processed_old")
-            # metrics：复用 ensure_tables 的当前列定义，保证一致
-            conn.execute("ALTER TABLE metrics RENAME TO metrics_old")
-            cols = ", ".join(f"{m['column']} {m['type']}" for m in METRICS.values())
-            conn.execute(
-                f"CREATE TABLE metrics (id INTEGER PRIMARY KEY, "
-                f"path TEXT UNIQUE NOT NULL, run_at TEXT, {cols})"
-            )
-            copy_cols = ["run_at"] + [m["column"] for m in METRICS.values()]
-            col_sql = ", ".join(copy_cols)
-            conn.execute(
-                f"INSERT INTO metrics (path, {col_sql}) "
-                f"SELECT path, {col_sql} FROM metrics_old"
-            )
-            conn.execute("DROP TABLE metrics_old")
-            _create_csv_indexes(conn)
-            conn.execute(f"PRAGMA user_version={_MIGRATE_VERSION}")
-        print("[migrate] 已迁移 processed/metrics 为 INTEGER rowid 主键结构。", file=sys.stderr)

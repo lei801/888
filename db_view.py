@@ -27,15 +27,16 @@ from tkinter import ttk, messagebox, filedialog
 import analysis
 from analysis import column_defs, join_clause, classify_line   # 指标列定义 / SQL JOIN 均来自 analysis
 
-# 表格展示最多加载的行数（仅影响界面渲染，不影响 CSV 导出）；None = 不限制，全量显示
-VIEW_ROW_LIMIT = 200
+# 分页设置（仅影响界面渲染，不影响 CSV 导出）
+MAX_ROWS = 3000      # 界面最多加载/浏览的总行数上限（超出部分提示用筛选缩小范围）
+PAGE_SIZE = 500      # 每页最多显示的行数
 
-# 有数据库索引、允许点击表头排序的列（与 analysis._create_csv_indexes 对齐：
-#   idx_processed_device -> 设备；idx_processed_ym -> 月份）。其余列点击表头不再排序。
+# 允许点击表头排序的列（设备、月份本身即 processed 表字段，排序无需额外索引）。
+# 其余列点击表头不再排序。
 _SORTABLE_COLS = {"设备", "月份"}
 
 # 固定列（顺序即表格显示顺序）；全部可在「显示列」对话框中勾选隐藏
-_FIXED_COLS = ["#", "设备", "月份", "路径", "大小", "处理时间"]
+_FIXED_COLS = ["#", "设备", "月份", "路径", "处理时间"]
 
 # 导出 CSV 时用户所选列的持久化文件（下次默认沿用）
 _EXPORT_COLS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csv_export_cols.json")
@@ -52,9 +53,14 @@ class DBViewApp:
         self._apply_style()
         devs, yms = self._load_filters()
         self._visible_cols, self._visible_fixed = self._load_visible_cols()
+        # 分页状态（新建分页栏前需先存在）
+        self._page = 0          # 当前页（0-based）
+        self._total_pages = 1   # 总页数（由 _refresh 依总数/每页大小计算）
+        self._page_size = PAGE_SIZE
         self._build_ui(devs, yms)
         self._refresh()
-        self._autosize_columns()   # 首次打开测量一次列宽（之后仅在列结构变化时重算）
+        # 延迟到布局完成再测宽（避免同帧内 Treeview 几何未就绪导致测量偏小）
+        self.root.after_idle(self._autosize_columns)
 
     def _apply_style(self):
         """统一字体 + 让表格行高随字体自适应（高分辨率下随 DPI 放大、不被裁切）。"""
@@ -105,9 +111,10 @@ class DBViewApp:
     def _make_col_index(self):
         """列名 -> 数据行元组下标（与列可见性无关，供排序取值用）。
         row = (device, ym, path, size, ts, 指标1, 指标2, ...)。"""
-        idx = {"设备": 0, "月份": 1, "路径": 2, "大小": 3, "处理时间": 4}
+        idx = {"设备": 0, "月份": 1, "路径": 2, "处理时间": 3}
+        # 固定列现占 4 个下标（device/ym/path/ts）；指标列从下标 4 起
         for j, name in enumerate(self._all_metric_cols_list):
-            idx[name] = 5 + j
+            idx[name] = 4 + j
         return idx
 
     # ---------- 列宽 / 对齐 辅助 ----------
@@ -211,16 +218,16 @@ class DBViewApp:
 
         g_line, self.line_lb = self._mk_multi(frm, "产线(多选)", self._lines, self._on_line_change)
         g_line.grid(row=0, column=0, padx=(0, 8), sticky="ns")
-        g_dev, self.dev_lb = self._mk_multi(frm, "设备(多选)", devs, self._refresh)
+        g_dev, self.dev_lb = self._mk_multi(frm, "设备(多选)", devs, self._on_filter_change)
         g_dev.grid(row=0, column=1, padx=(0, 8), sticky="ns")
-        g_ym, self.ym_lb = self._mk_multi(frm, "月份(多选)", yms, self._refresh)
+        g_ym, self.ym_lb = self._mk_multi(frm, "月份(多选)", yms, self._on_filter_change)
         g_ym.grid(row=0, column=2, padx=(0, 8), sticky="ns")
 
         p_grp = ttk.LabelFrame(frm, text="路径（通配符 * ?；多条件用 | 分隔，OR）", padding=4)
         p_grp.grid(row=0, column=3, sticky="nsew")
         self.q_var = tk.StringVar()
         ttk.Entry(p_grp, textvariable=self.q_var).pack(fill="x", padx=2, pady=2)
-        self.q_var.trace_add("write", lambda *a: self._refresh())
+        self.q_var.trace_add("write", lambda *a: self._on_filter_change())
 
         # ---- 筛选区：第二行 ----
         frm2 = ttk.Frame(self.root, padding=(8, 0, 8, 4))
@@ -252,20 +259,22 @@ class DBViewApp:
         self.tree = ttk.Treeview(self.root, columns=cols, show="headings")
         # 固定列宽度
         base_widths = {"#": 45, "设备": 70, "月份": 75, "路径": 420,
-                       "大小": 90, "处理时间": 140}
+                       "处理时间": 140}
         for c in fixed_vis:
             if c in _SORTABLE_COLS:
                 self.tree.heading(c, text=c, command=lambda c=c: self._on_heading_click(c))
             else:
                 self.tree.heading(c, text=c)
-            self.tree.column(c, width=base_widths[c], minwidth=40, anchor="w",
+            # 路径列设较大 minwidth 下限，避免多列挤压时被 stretch 缩成很窄一列
+            min_w = 420 if c == "路径" else 40
+            self.tree.column(c, width=base_widths[c], minwidth=min_w, anchor="w",
                              stretch=False)
         if "#" in cols:
             self.tree.column("#", anchor="center")
-        if "大小" in cols:
-            self.tree.column("大小", anchor="e")
         if "路径" in cols:
-            self.tree.column("路径", stretch=True)   # 路径列随窗口拉伸
+            # 路径列随窗口拉伸；但设较大的 minwidth 下限，避免勾选多列、
+            # 总宽超出窗口时被 stretch 挤压成很窄一列
+            self.tree.column("路径", stretch=True, minwidth=420)
         # 指标列宽度：按类型/名称给合理默认，允许拖拽调整
         for c in visible_metrics:
             if c in _SORTABLE_COLS:
@@ -297,6 +306,28 @@ class DBViewApp:
         self.root.rowconfigure(3, weight=1)
         self.root.columnconfigure(0, weight=1)
 
+        # ---- 分页栏（表格下方独立一行，左对齐，窄窗口也始终可见） ----
+        pf = ttk.Frame(self.root, padding=(4, 4))
+        pf.grid(row=5, column=0, sticky="w", padx=8, pady=(0, 4))
+        ttk.Label(pf, text="分页：").grid(row=0, column=0, padx=(0, 4))
+        self._pg_first = ttk.Button(pf, text="首页", width=5, command=lambda: self._goto_page(0))
+        self._pg_prev = ttk.Button(pf, text="上一页", width=6, command=lambda: self._goto_page(self._page - 1))
+        self._pg_label = ttk.Label(pf, text="第 1 / 1 页")
+        self._pg_next = ttk.Button(pf, text="下一页", width=6, command=lambda: self._goto_page(self._page + 1))
+        self._pg_last = ttk.Button(pf, text="末页", width=5, command=lambda: self._goto_page(self._total_pages - 1))
+        self._pg_first.grid(row=0, column=1, padx=2)
+        self._pg_prev.grid(row=0, column=2, padx=2)
+        self._pg_label.grid(row=0, column=3, padx=4)
+        self._pg_next.grid(row=0, column=4, padx=2)
+        self._pg_last.grid(row=0, column=5, padx=2)
+        ttk.Label(pf, text="每页").grid(row=0, column=6, padx=(6, 1))
+        self._pg_size = ttk.Combobox(pf, values=[200, 500, 1000, 2000, 3000],
+                                     width=5, state="readonly")
+        self._pg_size.set(str(self._page_size))
+        self._pg_size.bind("<<ComboboxSelected>>", self._on_page_size_change)
+        self._pg_size.grid(row=0, column=7, padx=1)
+        ttk.Label(pf, text="行").grid(row=0, column=8, padx=(1, 2))
+
         # ---- 选中复制（整行）：右键菜单 + Ctrl+C ----
         self._ctx_menu = tk.Menu(self.tree, tearoff=0)
         self._ctx_menu.add_command(label="复制选中行", command=self._copy_selected)
@@ -316,13 +347,15 @@ class DBViewApp:
         self.cols = cols
         self.tree.configure(columns=cols)
         base_widths = {"#": 45, "设备": 70, "月份": 75, "路径": 420,
-                       "大小": 90, "处理时间": 140}
+                       "处理时间": 140}
         for c in fixed_vis:
             if c in _SORTABLE_COLS:
                 self.tree.heading(c, text=c, command=lambda c=c: self._on_heading_click(c))
             else:
                 self.tree.heading(c, text=c)
-            self.tree.column(c, width=base_widths[c], minwidth=40, anchor="w",
+            # 路径列设较大 minwidth 下限，避免多列挤压时被 stretch 缩成很窄一列
+            min_w = 420 if c == "路径" else 40
+            self.tree.column(c, width=base_widths[c], minwidth=min_w, anchor="w",
                              stretch=False)
         if "#" in cols:
             self.tree.column("#", anchor="center")
@@ -341,8 +374,13 @@ class DBViewApp:
         self._col_index = self._make_col_index()
         # 清掉手动宽度记录（列结构已变，旧记录无意义）
         self._manual_widths = set()
-        # 仅列结构变化时才重新测量列宽（避免每次筛选刷新都卡）
-        self._autosize_columns()
+        # 注意：此处仅重建列结构，不测列宽；列宽由调用方在 _refresh() 之后
+        # 再调 _autosize_columns() 测量（必须基于新结构下的数据行，否则宽度错位）。
+
+    def _on_filter_change(self):
+        """筛选条件变化：回到第 0 页再刷新（避免停留在已无数据的旧页）。"""
+        self._page = 0
+        self._refresh()
 
     def _reset_filters(self):
         self.line_lb.selection_clear(0, "end")
@@ -350,7 +388,7 @@ class DBViewApp:
         self.ym_lb.selection_clear(0, "end")
         self.q_var.set("")
         self.stat_var.set("(全部)")
-        self._refresh()
+        self._on_filter_change()
 
     # ---------- 产线 → 设备 联动（单向） ----------
     def _on_line_change(self):
@@ -366,7 +404,7 @@ class DBViewApp:
                     continue
                 if classify_line(d) in lines:
                     self.dev_lb.selection_set(i)
-        self._refresh()
+        self._on_filter_change()
 
     # ---------- 数值解析 ----------
     @staticmethod
@@ -380,7 +418,7 @@ class DBViewApp:
             return "ERR"
 
     # ---------- 构建查询（筛选 + 通配符多选） ----------
-    def _query_sql(self, limit=None):
+    def _query_sql(self, limit=None, offset=0):
         dev_sel = self._sel(self.dev_lb)
         ym_sel = self._sel(self.ym_lb)
         q = self.q_var.get().strip()
@@ -415,7 +453,7 @@ class DBViewApp:
                 params.extend(pats)
 
         where = ("WHERE " + " AND ".join(wheres)) if wheres else ""
-        base_exprs = ["p.device", "p.ym", "p.path", "p.size", "p.ts"]
+        base_exprs = ["p.device", "p.ym", "p.path", "p.ts"]
         metric_exprs = [d[0] for d in column_defs()]
         sel = base_exprs + metric_exprs
         sql = (f"SELECT {', '.join(sel)} FROM processed p {join_clause()} "
@@ -424,19 +462,26 @@ class DBViewApp:
         count_sql = f"SELECT COUNT(*) FROM processed p {join_clause()} {where}"
         count_params = list(params)
         if limit:
-            sql += " LIMIT ?"
+            sql += " LIMIT ? OFFSET ?"
             params.append(limit)
+            params.append(offset)
         return sql, params, count_sql, count_params
 
     # ---------- 刷新表格 ----------
     def _refresh(self):
-        sql, params, count_sql, count_params = self._query_sql(limit=VIEW_ROW_LIMIT)
+        # 当前页偏移（受总上限 MAX_ROWS 约束，避免翻到不存在的页）
+        offset = self._page * self._page_size
+        # 本页实际取行数：不超过每页大小，且不超过总上限剩余
+        limit = min(self._page_size, MAX_ROWS - offset)
+        if limit <= 0:
+            limit = 0
+        sql, params, count_sql, count_params = self._query_sql(limit=limit, offset=offset)
         if sql is None:
             return
         try:
             c = self._conn()
-            rows = c.execute(sql, params).fetchall()
-            # 真实总数（不受 LIMIT 影响），用于状态栏提示
+            rows = c.execute(sql, params).fetchall() if limit else []
+            # 真实总数（不受 LIMIT 影响），用于分页与状态栏提示
             total = c.execute(count_sql, count_params).fetchone()[0]
             c.close()
         except sqlite3.Error as e:
@@ -445,6 +490,22 @@ class DBViewApp:
 
         self._raw_rows = rows
         self._total_count = total
+        # 总页数：按「界面可浏览上限」与每页大小计算（超出 MAX_ROWS 的部分不可翻页浏览）
+        _browse_total = min(total, MAX_ROWS)
+        self._total_pages = max(1, (min(total, MAX_ROWS) + self._page_size - 1) // self._page_size)
+        if self._page >= self._total_pages:
+            self._page = self._total_pages - 1
+            offset = self._page * self._page_size
+            limit = min(self._page_size, MAX_ROWS - offset)
+            sql2, params2, _, _ = self._query_sql(limit=limit, offset=offset)
+            try:
+                c = self._conn()
+                rows = c.execute(sql2, params2).fetchall() if limit else []
+                c.close()
+            except sqlite3.Error:
+                pass
+            self._raw_rows = rows
+        self._update_pager()
         self._render_rows()
 
     # ---------- 排序与渲染 ----------
@@ -494,23 +555,30 @@ class DBViewApp:
                     vals.append(row[col_index[c]] or "")
                 elif c == "路径":
                     vals.append(row[col_index[c]])
-                elif c == "大小":
-                    v = row[col_index[c]]
-                    vals.append(v if v is not None else "")
-                else:                 # 指标列
+                else:                 # 指标列（含"大小"）
                     vals.append(row[col_index[c]])
             self.tree.insert("", "end", values=tuple(vals))
         total = getattr(self, "_total_count", len(rows))
         shown = len(rows)
-        if shown < total:
-            self.stat_var.set(f"显示前 {shown} 条（共 {total} 个文件，请用筛选缩小范围）")
+        # 分页信息：当前页显示的行区间（相对全量）
+        if total == 0:
+            self.stat_var.set("共 0 个文件")
         else:
-            self.stat_var.set(f"共 {total} 个文件")
+            start = self._page * self._page_size + 1
+            end = start + shown - 1
+            if total > MAX_ROWS:
+                self.stat_var.set(
+                    f"显示第 {start}–{end} 条（界面上限 {MAX_ROWS} / 共 {total} 个文件，"
+                    f"请用筛选缩小范围翻看后续）")
+            else:
+                self.stat_var.set(f"显示第 {start}–{end} 条（共 {total} 个文件）")
         self._update_headings()
 
     def _autosize_columns(self):
-        """按表头文字 + 当前可见行内容自动撑开列宽（取最大值，留少量边距）。
-        路径列保持拉伸；用户手动拖拽过的列不再自动调整。
+        """按「表头文字 + 当前可见行内容」取最大值撑开列宽，列宽严格贴合内容、不留多余空白。
+        - 以 50px 为绝对下限，仅防「该列当前页几乎无内容」时塌陷；
+        - 表头 / 内容均为实测宽度，长中文表头与长值自然撑开；
+        - 路径列随窗口拉伸，不自动收缩；用户手动拖过的列不再自动调整。
         仅在列结构变化 / 首次打开时调用一次，避免每次筛选刷新都卡顿。"""
         import tkinter.font as tkfont
         # 缓存测量字体对象（避免每次重算都 new，进一步加速）
@@ -519,8 +587,10 @@ class DBViewApp:
             self._measure_head_font = tkfont.Font(font=("Microsoft YaHei", 9, "bold"))
         font = self._measure_font
         head_font = self._measure_head_font
-        PAD = 12
-        SAMPLE = 120   # 仅采样当前显示的前 120 行测宽度（原采样 300 行，降为 120 进一步加速）
+        PAD = 10          # 内容左右边距（贴合内容，避免右侧多余空白）
+        HEAD_PAD = 6      # 表头额外余量（给排序箭头 ▲/▼ 留位）
+        MIN_W = 50        # 绝对下限：仅防止该列当前页几乎无内容时列过窄
+        SAMPLE = 200      # 采样当前显示的前 200 行测宽度（更全面，仍毫秒级）
         for col in self.cols:
             # 路径列随窗口拉伸，不自动收缩
             if col == "路径":
@@ -528,18 +598,21 @@ class DBViewApp:
             # 用户手动拖过的列保持其宽度
             if col in self._manual_widths:
                 continue
-            # 表头宽度
-            head_w = head_font.measure(col) + PAD + 8  # +8 给排序箭头留位
+            # 表头宽度（中文 bold 测量偏保守，PAD 已含余量）
+            head_w = head_font.measure(col) + PAD + HEAD_PAD
             # 内容宽度：采样前若干行取最大值
             content_w = 0
             for iid in self.tree.get_children()[:SAMPLE]:
                 v = self.tree.set(iid, col)
+                if not v:
+                    continue
                 w = font.measure(v) + PAD
                 if w > content_w:
                     content_w = w
-            best = max(head_w, content_w, 40)
+            # 列宽 = max(表头, 内容)，贴合实际；仅以 MIN_W 兜底防止塌陷
+            best = max(MIN_W, head_w, content_w)
             # 设上限，避免过宽
-            best = min(best, 400)
+            best = min(best, 500)
             self.tree.column(col, width=best)
 
     def _on_col_resize(self):
@@ -572,6 +645,40 @@ class DBViewApp:
                 else " ▼" if self._sort_col == name and self._sort_dir == "desc" \
                 else ""
             self.tree.heading(name, text=name + arrow)
+
+    # ---------- 分页 ----------
+    def _update_pager(self):
+        """刷新分页栏文字与按钮可用状态（由 _refresh 调用）。"""
+        self._pg_label.config(text=f"第 {self._page + 1} / {self._total_pages} 页")
+        at_first = self._page <= 0
+        at_last = self._page >= self._total_pages - 1
+        self._pg_first.state(["disabled"] if at_first else ["!disabled"])
+        self._pg_prev.state(["disabled"] if at_first else ["!disabled"])
+        self._pg_next.state(["disabled"] if at_last else ["!disabled"])
+        self._pg_last.state(["disabled"] if at_last else ["!disabled"])
+
+    def _goto_page(self, page):
+        """跳转到指定页（0-based），越界自动夹紧，并刷新。"""
+        if page < 0:
+            page = 0
+        if page > self._total_pages - 1:
+            page = self._total_pages - 1
+        if page == self._page:
+            return
+        self._page = page
+        self._refresh()
+
+    def _on_page_size_change(self, _ev=None):
+        """修改每页大小：重置到第 0 页并重算总页数。"""
+        try:
+            size = int(self._pg_size.get())
+        except ValueError:
+            return
+        if size <= 0:
+            return
+        self._page_size = size
+        self._page = 0
+        self._refresh()
 
     # ---------- 选中复制（整行） ----------
     def _copy_selected(self):
@@ -638,7 +745,7 @@ class DBViewApp:
         fixed_frm.pack(fill="x", pady=(0, 8))
         fvars = {}
         _fixed_names = {"#": "序号", "设备": "设备", "月份": "月份",
-                        "路径": "路径", "大小": "大小", "处理时间": "处理时间"}
+                        "路径": "路径", "处理时间": "处理时间"}
         for i, col in enumerate(_FIXED_COLS):
             init = col in saved if saved is not None else True
             v = tk.BooleanVar(value=init)
@@ -683,15 +790,21 @@ class DBViewApp:
             wd = ttk.Checkbutton(inner, text="%s  (%s)" % (label, key), variable=v)
             _exp_widgets.append(wd)
 
-        # 自适应列数：按 Canvas 可用宽度估算每行列数，窗口/面板拉伸时自动重排
-        _AUTO_COL_W = 150   # 每列估算像素宽度
+        # 自适应列数：按实际测量的每列宽度估算每行列数，窗口/面板拉伸时自动重排
+        # 不再用固定估算值(150)直接算，因为中文"名称 (key)"实际更宽，固定估算会溢出裁切最右列
+        _GAP = 12   # 列间距
+        def _measure_col_w():
+            # 取所有复选框实际请求宽度中的最大值作为单列宽，保证该行每一列都完整放得下
+            dlg.update_idletasks()
+            _ws = [w.winfo_reqwidth() for w in _exp_widgets]
+            return max(_ws) if _ws else 150
         def _relayout_exp_cols():
             _w = canv.winfo_width()
-            # 每列预留 padx 余量，避免最右列被 Canvas 边缘裁切、名称显示不全
-            _n = max(1, _w // (_AUTO_COL_W + 14))
+            _col_w = _measure_col_w()
+            _n = max(1, _w // (_col_w + _GAP))
             for _i, _wd in enumerate(_exp_widgets):
                 _wd.grid(row=_i // _n, column=_i % _n, sticky="w",
-                         padx=(0, 14), pady=2)
+                         padx=(0, 12), pady=2)
             canv.configure(scrollregion=canv.bbox("all"))
 
         canv.bind("<Configure>", lambda e: _relayout_exp_cols())
@@ -756,7 +869,7 @@ class DBViewApp:
         fixed_frm.grid(row=1, column=0, sticky="ew", pady=(0, 8))
         fvars = {}
         _fixed_names = {"#": "序号", "设备": "设备", "月份": "月份",
-                        "路径": "路径", "大小": "大小", "处理时间": "处理时间"}
+                        "路径": "路径", "处理时间": "处理时间"}
         for i, col in enumerate(_FIXED_COLS):
             v = tk.BooleanVar(value=col in self._visible_fixed)
             fvars[col] = v
@@ -801,15 +914,21 @@ class DBViewApp:
                                  variable=v)
             _vis_widgets.append(wd)
 
-        # 自适应列数：按 Canvas 可用宽度估算每行列数，窗口/面板拉伸时自动重排
-        _AUTO_COL_W = 150   # 每列估算像素宽度
+        # 自适应列数：按实际测量的每列宽度估算每行列数，窗口/面板拉伸时自动重排
+        # 不再用固定估算值(150)直接算，因为中文"名称 (key)"实际更宽，固定估算会溢出裁切最右列
+        _GAP = 12   # 列间距
+        def _measure_col_w():
+            # 取所有复选框实际请求宽度中的最大值作为单列宽，保证该行每一列都完整放得下
+            dlg.update_idletasks()
+            _ws = [w.winfo_reqwidth() for w in _vis_widgets]
+            return max(_ws) if _ws else 150
         def _relayout_vis_cols():
             _w = canv.winfo_width()
-            # 每列预留 padx 余量，避免最右列被 Canvas 边缘裁切、名称显示不全
-            _n = max(1, _w // (_AUTO_COL_W + 14))
+            _col_w = _measure_col_w()
+            _n = max(1, _w // (_col_w + _GAP))
             for _i, _wd in enumerate(_vis_widgets):
                 _wd.grid(row=_i // _n, column=_i % _n, sticky="w",
-                         padx=(0, 14), pady=2)
+                         padx=(0, 12), pady=2)
             canv.configure(scrollregion=canv.bbox("all"))
 
         canv.bind("<Configure>", lambda e: _relayout_vis_cols())
@@ -828,13 +947,14 @@ class DBViewApp:
             self._visible_cols = set(sel)
             self._visible_fixed = {c for c in _FIXED_COLS if fvars[c].get()}
             self._save_visible_cols()
-            _cleanup()
             dlg.destroy()
             self._rebuild_tree_columns()
             self._refresh()
+            # 延迟到布局完成后再测宽：对话框关闭后同帧内 Treeview 尚未完成几何布局，
+            # 此时 font.measure 测不准（尤其中文表头），会导致列宽未按真实渲染撑开。
+            self.root.after_idle(self._autosize_columns)
 
         def _cancel():
-            _cleanup()
             dlg.destroy()
 
         ttk.Button(bf, text="全选", command=lambda: _set_all(True)).grid(row=0, column=0, padx=3)

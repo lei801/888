@@ -74,10 +74,10 @@
 | `id` | INTEGER PK | 自增主键（rowid 结构） |
 | `path` | TEXT UNIQUE | 文件完整路径（去重主键） |
 | `ts` | TEXT | 处理时间（`YYYY-MM-DD HH:MM:SS`） |
-| `size` | INTEGER | 文件大小（字节） |
-| `mtime` | REAL | 文件修改时间（Unix 时间戳，用于诊断） |
 | `device` | TEXT | 设备号（从路径解析，如 `D32`/`E03`/`E31`/`E32`；非设备路径为 NULL） |
 | `ym` | TEXT | 数据月份 `YYYYMM`（从路径 `BACKUP_YYYYMM` 或 `CPU1-YYYYMMDD` 解析；解析不到为 NULL） |
+
+> 注：文件大小 `size` 已不再存于 `processed`，改由「计算指标」阶段写入 `metrics.size`（见下）；文件修改时间 `mtime` 已彻底废弃（扫描阶段不取，避免 SMB 网络 stat 往返）。
 
 > 索引：`idx_processed_ym`(ym)、`idx_processed_device`(device)，供查看器按月份/设备筛选与排序。
 
@@ -99,6 +99,7 @@
 | `inner_sum` / `outer_sum` | INTEGER | **内层/外层 MISS 总回数**：上述各代码计数之和 |
 | `inner_odd` | INTEGER | **内层 MISS 奇数**：K = 20、L ∈ 代码清单且 L 为奇数的行数 |
 | `std_inner` / `std_outer` | REAL | **内层/外层剥离值方差**：K=0 的 Z（第 12 列）/ K=1 的 AB（第 26 列）**样本标准差**（n-1，≥2 个值才算），round 2 |
+| `size` | INTEGER | **文件大小**：`os.path.getsize(path)`（字节）。扫描阶段不取（性能），于「计算指标」时一并写入；查看器/CSV 导出「大小」列取自此。 |
 
 > **口径说明（自 Excel Power Query 迁移）**：以上除 `col2_count` 外均为 PQ 口径的忠实复刻。
 > 所有统计先做「有效数据」前置过滤：**K、L 两列均可转为数字的行**才参与计算。

@@ -55,7 +55,6 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 RECALC_LOG = os.path.join(_HERE, "scan_state_recalc_log.txt")
 DB_FILE = os.path.join(_HERE, "scan_state.db")          # 状态库（SQLite，单文件，存已处理文件路径）
 INI_FILE = os.path.join(_HERE, "scan_state.ini")         # 配置（ini，存扫描设置等标量配置）
-JSON_FILE = os.path.join(_HERE, "scan_state.json")      # 旧格式，启动首次迁移后删除
 
 # ====================== 配置区 ======================
 POLL_INTERVAL = 20   # 默认轮询间隔（秒），可在 UI「轮询间隔」中输入覆盖，持久化到 state
@@ -92,7 +91,7 @@ def _open_db():
     """打开（必要时建表）SQLite 状态库；check_same_thread=False 以便后台线程共用，调用方用锁保护。
 
     新库直接采用 INTEGER rowid 主键（id 自增 + path UNIQUE 业务唯一键），二级索引指针仅 8 字节，
-    百万级下库体几乎不膨胀；旧库（path TEXT 主键）由 analysis.migrate_to_rowid 在启动时自动迁移。
+    百万级下库体几乎不膨胀；数据库会重置，故仅干净建表，不做任何 schema 迁移。
     """
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     # 开启 WAL：读写并发（自动导出/查看器的只读连接与扫描写互不阻塞）。
@@ -100,7 +99,7 @@ def _open_db():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("CREATE TABLE IF NOT EXISTS processed "
                  "(id INTEGER PRIMARY KEY, "
-                 "path TEXT UNIQUE NOT NULL, ts TEXT, size INTEGER, mtime REAL, "
+                 "path TEXT UNIQUE NOT NULL, ts TEXT, "
                  "device TEXT, ym TEXT)")
     conn.commit()
     return conn
@@ -187,8 +186,9 @@ def _dev_ym(path: str) -> tuple[str, str]:
 
 
 def insert_processed(conn, rows: list[tuple[Any, ...]], lock: threading.Lock | None = None) -> None:
-    """批量写入新增记录（path, ts, size, mtime）；同时回填 device/ym，供查看与按月份重算。
+    """批量写入新增记录（path, ts）；同时回填 device/ym，供查看与按月份重算。
 
+    size 已挪到 metrics 表（由「计算指标」阶段填），processed 不再存 size/mtime。
     INSERT OR IGNORE 去重，仅新增行落盘。
     """
     if not rows:
@@ -198,7 +198,7 @@ def insert_processed(conn, rows: list[tuple[Any, ...]], lock: threading.Lock | N
         with conn:
             conn.executemany(
                 "INSERT OR IGNORE INTO processed "
-                "(path, ts, size, mtime, device, ym) VALUES (?, ?, ?, ?, ?, ?)",
+                "(path, ts, device, ym) VALUES (?, ?, ?, ?)",
                 [r + _dev_ym(r[0]) for r in rows])
 
 
@@ -208,48 +208,6 @@ def reset_processed_db(conn, lock: threading.Lock | None = None) -> None:
     with cm:
         with conn:
             conn.execute("DELETE FROM processed")
-
-
-def migrate_json_if_needed(conn, lock: threading.Lock | None = None) -> None:
-    """一次性迁移（仅首次运行旧版本时触发）：
-       - 旧 scan_state.json（如有）：配置写入 ini（processed 已无，跳过）；
-       - 旧 meta 表（如有，旧 schema）：配置写入 ini，随后 DROP meta 表；
-       迁移完成后删除 JSON。"""
-    cfg = load_config()
-    migrated = False
-    # 1) 旧 JSON
-    if os.path.isfile(JSON_FILE):
-        try:
-            with open(JSON_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for k in _DEFAULT_CONFIG:
-                if k in data:
-                    cfg[k] = data[k]
-            migrated = True
-        except Exception as e:
-            print("读取旧 JSON 失败，跳过：", e, file=sys.stderr)
-        try:
-            os.remove(JSON_FILE)
-            print("已迁移旧 scan_state.json 至 ini 并删除原文件。", file=sys.stderr)
-        except OSError as e:
-            print("删除旧 JSON 失败（配置已迁移）：", e, file=sys.stderr)
-    # 2) 旧 meta 表（启动期一次性迁移，此时扫描线程尚未运行，无需加锁）
-    with _nullcontext():
-        try:
-            if list(conn.execute("SELECT 1 FROM meta LIMIT 1")):
-                for key, val in conn.execute("SELECT key, value FROM meta"):
-                    try:
-                        cfg[key] = json.loads(val)
-                    except Exception:
-                        pass
-                migrated = True
-                conn.execute("DROP TABLE IF EXISTS meta")
-                conn.commit()
-        except sqlite3.Error:
-            pass  # meta 表不存在
-    if migrated:
-        save_config(cfg)
-        print("已迁移旧配置到 ini（scan_state.ini）。", file=sys.stderr)
 
 
 # -------------------------- 文件遍历（os.scandir 递归，性能优于 os.walk） --------------------------
@@ -390,19 +348,6 @@ def discover_backup_targets(root, months, device_list, lines=None):
     return targets
 
 
-# -------------------------- 处理逻辑（用户可替换） --------------------------
-def process_file(path):
-    """★ 在此填写你的「处理」逻辑。成功返回即可；失败请 raise，会被捕获并重试。
-    默认实现：仅读取文件大小（占位）。下面给一个统计 CSV 行数的示例可取消注释。
-
-    示例（统计行数）：
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            n = sum(1 for _ in f)
-        return n
-    """
-    return os.path.getsize(path)  # 占位：仅确认可读并返回字节数
-
-
 # -------------------------- GUI --------------------------
 class ScannerApp:
     def __init__(self, root):
@@ -420,9 +365,7 @@ class ScannerApp:
 
         self.db_lock: threading.Lock = threading.Lock()
         self.conn = _open_db()
-        analysis.ensure_tables(self.conn, self.db_lock)   # 建/迁移指标宽表 metrics（新库已是 rowid 结构）
-        analysis.migrate_to_rowid(self.conn, self.db_lock)  # 旧库 TEXT 主键 → INTEGER rowid（带备份，幂等）
-        migrate_json_if_needed(self.conn, self.db_lock)  # 旧 JSON 一次性迁移后删除
+        analysis.ensure_tables(self.conn, self.db_lock)   # 建指标宽表 metrics（数据库会重置，仅干净建表）
         self.state: dict[str, Any] = load_config()                      # 配置（ini）
         # 逐设备上月确认标志（内存态，仅月初窗口期用）：{设备号: 已确认到的月份YYYYMM}。
         # 不持久化——窗口外本就不读它；窗口内重启仅首轮多扫一次上月目录、当轮即全部重新确认，无漏扫。
@@ -1313,7 +1256,7 @@ class ScannerApp:
                     if scanned % 500 == 0:
                         self.q.put(("status", "发现中… 已枚举 %d 个文件" % scanned))
                     # 方案A：仅凭文件名去重，不再调用 entry.stat()（省去每个文件的额外网络往返）
-                    # candidates 改为单元素元组 (fpath,)，size/mtime 不再获取
+                    # candidates 为单元素元组 (fpath,)，size 改由「计算指标」阶段写入 metrics
                     if is_candidate(fpath, self.processed_set):
                         candidates.append((fpath,))
             except Exception as e:
@@ -1360,22 +1303,17 @@ class ScannerApp:
             if folder != last_folder:
                 self.q.put(("current", folder))
                 last_folder = folder
-            # 扫到的新文件名直接处理（不做写完判定）
-            try:
-                process_file(fpath)
-                ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                self.processed_set.add(fpath)                 # 内存集合：O(1) 去重
-                self.folder_counts[folder] = self.folder_counts.get(folder, 0) + 1  # 同步累计计数
-                self.pending_rows.append((fpath, ts, None, None))  # 待落盘（方案A：size/mtime 不取，留 NULL）
-                done += 1
-                new_per_folder[folder] = new_per_folder.get(folder, 0) + 1
-                self.q.put(("done_count", done))
-                # 进度
-                if total > 0:
-                    self.q.put(("progress", int(done * 100 / total)))
-            except Exception as e:
-                self.q.put(("log", "处理失败：%s | %s" % (fpath, e)))
-                # 失败不计入 processed，下次仍是候选；这里不改 state
+            # 扫到的新文件名直接处理（不做写完判定，无额外网络 I/O）
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            self.processed_set.add(fpath)                 # 内存集合：O(1) 去重
+            self.folder_counts[folder] = self.folder_counts.get(folder, 0) + 1  # 同步累计计数
+            self.pending_rows.append((fpath, ts))  # 待落盘（方案A：不取 size/mtime；size 在算指标时入 metrics）
+            done += 1
+            new_per_folder[folder] = new_per_folder.get(folder, 0) + 1
+            self.q.put(("done_count", done))
+            # 进度
+            if total > 0:
+                self.q.put(("progress", int(done * 100 / total)))
 
         if total > 0 and not self.stop_event.is_set():
             self.q.put(("progress", 100))
@@ -1748,7 +1686,8 @@ class RecalcDialog(tk.Toplevel):
         frm_bottom = ttk.Frame(self)
         frm_bottom.pack(side="bottom", fill="x", padx=10, pady=(4, 6))
 
-        # 顶部列表区：expand 吸收剩余空间，保证设备/月份列表框始终可见（高度仍固定，不随拉伸变化）
+        # 顶部列表区：作为容器，剩余垂直空间交由下方设备/月份列表框按比例吸收，
+        # 自身不再 expand 独占空间（否则多余高度被空 Frame 吃掉，月份框下方留白）
         frm_top = ttk.Frame(self)
         frm_top.pack(side="top", fill="both", expand=True)
 
@@ -1765,11 +1704,11 @@ class RecalcDialog(tk.Toplevel):
 
         # 设备（多选，留空=全部设备）—— 带 LabelFrame 外框，Listbox 去边框，与导出列融为一体
         dev_frame = ttk.LabelFrame(frm_top, text="设备（可多选，留空=全部设备）")
-        dev_frame.pack(fill="x", padx=10, pady=(8, 2))
+        dev_frame.pack(fill="both", expand=True, padx=10, pady=(8, 2))
         self.dev_listbox = tk.Listbox(dev_frame, selectmode="multiple", height=5,
                                       exportselection=False, borderwidth=0, relief="flat")
-        # 设备列表框固定 5 行高度（不随窗口拉伸变化）；滚动条紧贴列表，无内边距
-        self.dev_listbox.pack(side="left", fill="x", expand=True, pady=2)
+        # 设备列表框随窗口拉伸伸长（fill=both+expand），吸收剩余高度，避免月份框下方留白
+        self.dev_listbox.pack(side="left", fill="both", expand=True, pady=2)
         dev_sb = ttk.Scrollbar(dev_frame, command=self.dev_listbox.yview)
         dev_sb.pack(side="right", fill="y")
         self.dev_listbox.config(yscrollcommand=dev_sb.set)
@@ -1778,11 +1717,11 @@ class RecalcDialog(tk.Toplevel):
 
         # 月份（多选，留空=全部月份）—— 带 LabelFrame 外框，Listbox 去边框，与设备/导出列融为一体
         frm = ttk.LabelFrame(frm_top, text="月份（可多选，Ctrl/Shift 连选；留空=全部月份）")
-        frm.pack(fill="x", padx=10, pady=4)
+        frm.pack(fill="both", expand=True, padx=10, pady=4)
         self.mth_listbox = tk.Listbox(frm, selectmode="multiple", height=6,
                                       exportselection=False, borderwidth=0, relief="flat")
-        # 月份列表框固定 6 行高度（不随窗口拉伸变化）；滚动条紧贴列表，无内边距
-        self.mth_listbox.pack(side="left", fill="x", expand=True, pady=2)
+        # 月份列表框随窗口拉伸伸长（fill=both+expand），吸收剩余高度，避免下方留白
+        self.mth_listbox.pack(side="left", fill="both", expand=True, pady=2)
         sb = ttk.Scrollbar(frm, command=self.mth_listbox.yview)
         sb.pack(side="right", fill="y")
         self.mth_listbox.config(yscrollcommand=sb.set)
@@ -2122,11 +2061,11 @@ class ManualExportDialog(tk.Toplevel):
 
         # 设备（多选，留空=全部）—— 带 LabelFrame 外框，滚动条同导出列的右侧独立列样式
         dev_frame = ttk.LabelFrame(frm_top, text="设备（可多选，留空=全部设备）")
-        dev_frame.pack(fill="x", padx=10, pady=(8, 2))
+        dev_frame.pack(fill="both", expand=True, padx=10, pady=(8, 2))
         dev_inner = ttk.Frame(dev_frame)
-        dev_inner.pack(fill="x", pady=2)
+        dev_inner.pack(fill="both", expand=True, pady=2)
         self.dev_listbox = tk.Listbox(dev_inner, selectmode="multiple", height=5, exportselection=False, borderwidth=0, relief="flat")
-        self.dev_listbox.pack(side="left", fill="x", expand=True)
+        self.dev_listbox.pack(side="left", fill="both", expand=True)
         dev_sb = ttk.Scrollbar(dev_inner, command=self.dev_listbox.yview)
         dev_sb.pack(side="right", fill="y")
         self.dev_listbox.config(yscrollcommand=dev_sb.set)
@@ -2134,11 +2073,11 @@ class ManualExportDialog(tk.Toplevel):
 
         # 月份（多选，留空=全部月份）—— 带 LabelFrame 外框，滚动条同导出列的右侧独立列样式
         mth_frame = ttk.LabelFrame(frm_top, text="月份（可多选，Ctrl/Shift 连选；留空=全部月份）")
-        mth_frame.pack(fill="x", padx=10, pady=4)
+        mth_frame.pack(fill="both", expand=True, padx=10, pady=4)
         mth_inner = ttk.Frame(mth_frame)
-        mth_inner.pack(fill="x", pady=2)
+        mth_inner.pack(fill="both", expand=True, pady=2)
         self.mth_listbox = tk.Listbox(mth_inner, selectmode="multiple", height=6, exportselection=False, borderwidth=0, relief="flat")
-        self.mth_listbox.pack(side="left", fill="x", expand=True)
+        self.mth_listbox.pack(side="left", fill="both", expand=True)
         mth_sb = ttk.Scrollbar(mth_inner, command=self.mth_listbox.yview)
         mth_sb.pack(side="right", fill="y")
         self.mth_listbox.config(yscrollcommand=mth_sb.set)

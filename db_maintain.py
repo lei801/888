@@ -69,11 +69,10 @@ def main():
 
     conn = sqlite3.connect(DB)
     conn.execute("PRAGMA journal_mode=WAL")
-    analysis.ensure_tables(conn)   # 确保 metrics 宽表存在（含旧 results/met_* 表一次性迁移）
-    analysis.migrate_to_rowid(conn)  # 旧库 → INTEGER rowid（带备份，幂等）；确保索引存在
+    analysis.ensure_tables(conn)   # 确保 metrics 宽表存在（数据库会重置，仅干净建表）
     cur = conn.cursor()
 
-    # 2) 补列 + 回填 device/ym
+    # 2) 回填 device/ym（主库 processed 表由主程序 ensure 建好，已含这两列；此处兜底确保列存在）
     for col in ("device", "ym"):
         try:
             cur.execute(f"ALTER TABLE processed ADD COLUMN {col} TEXT")
@@ -97,12 +96,12 @@ def main():
     cy, cm = divmod(cutoff_months, 12)
     cutoff_ym_lit = cy * 100 + (cm + 1)   # 转回 YYYYMM 便于阅读
     all_rows = cur.execute(
-        "SELECT path, ts, size, mtime, device, ym FROM processed").fetchall()
+        "SELECT path, ts, device, ym FROM processed").fetchall()
     old_rows = []
     keep_cnt = 0
     no_ym = 0
     for r in all_rows:
-        ym_s = r[5]
+        ym_s = r[3]
         if ym_s is None or not str(ym_s).isdigit():
             no_ym += 1
             keep_cnt += 1               # ym 未知：保守保留
@@ -123,17 +122,17 @@ def main():
             os.remove(arc_db)
         a = sqlite3.connect(arc_db)
         a.execute("CREATE TABLE processed (id INTEGER PRIMARY KEY, "
-                  "path TEXT UNIQUE NOT NULL, ts TEXT, size INTEGER, "
-                  "mtime REAL, device TEXT, ym TEXT)")
+                  "path TEXT UNIQUE NOT NULL, ts TEXT, "
+                  "device TEXT, ym TEXT)")
         a.executemany(
-            "INSERT INTO processed (path, ts, size, mtime, device, ym) "
-            "VALUES (?, ?, ?, ?, ?, ?)", old_rows)
+            "INSERT INTO processed (path, ts, device, ym) "
+            "VALUES (?, ?, ?, ?)", old_rows)
         a.commit()
         a.close()
         arc_csv = os.path.join(HERE, f"scan_state_archive_{TS}.csv")
         with open(arc_csv, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
-            w.writerow(["path", "ts", "size", "mtime", "device", "ym"])
+            w.writerow(["path", "ts", "device", "ym"])
             w.writerows(old_rows)
         print(f"       旧记录归档 -> {arc_db}")
         print(f"       旧记录导出 -> {arc_csv}")

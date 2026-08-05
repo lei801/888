@@ -1,8 +1,7 @@
 {
   "metrics": [
-    "block",
     "fdate",
-    "hinmei_fmt",
+    "hinmei",
     "inner_570",
     "inner_586",
     "inner_587",
@@ -17,6 +16,7 @@
     "outer_588",
     "outer_sum",
     "outer_total",
+    "size",
     "std_inner",
     "std_outer",
     "total_max"
@@ -24,6 +24,8 @@
   "fixed": [
     "#",
     "设备",
-    "月份"
+    "月份",
+    "路径",
+    "处理时间"
   ]
 }
