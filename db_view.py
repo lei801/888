@@ -3,7 +3,8 @@
 """
 用标准库(tkinter + sqlite3)直接读取 scan_state.db 并以表格展示文件记录。
   - 只读连接，不修改数据库（可与扫描器 GUI 并发查看）。
-  - 表格列：序号 / 设备 / 月份 / 路径 / 大小 / 处理时间 + `analysis.METRICS` 的全部指标列（品名/原品名/LOT/Block/日期/总枚数/外层枚数/内外层各报警代码/MISS总回数·奇数/剥离值方差）。
+  - 表格列：固定列 `# / 设备 / 月份 / 路径 / 处理时间` + `analysis.METRICS` 的全部指标列（品名/原品名/LOT/Block/日期/总枚数/外层枚数/内外层各报警代码/MISS总回数·奇数/剥离值方差/**大小**）。
+  - 「大小」(`metrics.size`) 在「计算指标」阶段由 os.path.getsize 取一次、写入 metrics 表；扫描发现阶段不取 size（只存 path/ts）以保性能，故大小属于 metrics 指标宽表、是 METRICS 注册表最后一项，不在固定列。
   - 筛选条件（实时生效）：
       设备：多选列表框（可全选/清空，支持 (空) 表示 device 为 NULL）
       月份：多选列表框（同上）
@@ -79,10 +80,14 @@ class DBViewApp:
                         break
                     except Exception:
                         continue
-        style.configure(".", font=("Microsoft YaHei", 9))
-        tv_font = tkfont.Font(font=("Microsoft YaHei", 10))
-        style.configure("Treeview", font=tv_font, rowheight=tv_font.metrics("linespace") + 6)
-        style.configure("Treeview.Heading", font=("Microsoft YaHei", 9, "bold"))
+        # 表格字体沿用全局默认（ttk 主题决定的 Treeview 内容字体，
+        # 经实测 style.configure("Treeview", font=...) 在本主题下不生效，
+        # 故不在此硬性更换字体，避免"改了等于没改"的错觉）。
+        style.configure(".", font=("Microsoft YaHei", 8))
+        # 行高随字体行距自适应（高分辨率下不被裁切）；加一点余量让行更宽松
+        row_font = tkfont.Font(font=("Microsoft YaHei", 8))
+        style.configure("Treeview", rowheight=row_font.metrics("linespace") + 8)
+        style.configure("Treeview.Heading", font=("Microsoft YaHei", 8, "bold"))
 
     # 只读连接；mode=ro 失败则回退普通连接（我们只会 SELECT）
     def _conn(self):
@@ -101,7 +106,7 @@ class DBViewApp:
                    c.execute("SELECT DISTINCT ym FROM processed ORDER BY ym")]
             c.close()
         except sqlite3.Error as e:
-            messagebox.showerror("打开数据库失败", str(e))
+            messagebox.showerror("打开数据库失败", str(e), parent=self.root)
             devs, yms = [], []
         return devs, yms
 
@@ -257,24 +262,27 @@ class DBViewApp:
         self.cols = cols
         self._all_metric_cols_list = all_metric_cols
         self.tree = ttk.Treeview(self.root, columns=cols, show="headings")
+        # 隔行灰色 tag：必须等 self.tree 创建后再配置（在 _apply_style 里会因 tree 未创建而失效）
+        self.tree.tag_configure("oddrow", background="#F2F2F2")
         # 固定列宽度
-        base_widths = {"#": 45, "设备": 70, "月份": 75, "路径": 420,
+        base_widths = {"#": 45, "设备": 70, "月份": 75, "路径": 260,
                        "处理时间": 140}
         for c in fixed_vis:
             if c in _SORTABLE_COLS:
                 self.tree.heading(c, text=c, command=lambda c=c: self._on_heading_click(c))
             else:
                 self.tree.heading(c, text=c)
-            # 路径列设较大 minwidth 下限，避免多列挤压时被 stretch 缩成很窄一列
-            min_w = 420 if c == "路径" else 40
+            # 路径列 minwidth 仅防空路径塌陷；真实宽度由 _autosize_columns 按内容测量，
+            # 不再设大下限，否则 width<minwidth 时被强制撑开产生空白
+            min_w = 120 if c == "路径" else 40
             self.tree.column(c, width=base_widths[c], minwidth=min_w, anchor="w",
                              stretch=False)
         if "#" in cols:
             self.tree.column("#", anchor="center")
         if "路径" in cols:
-            # 路径列随窗口拉伸；但设较大的 minwidth 下限，避免勾选多列、
-            # 总宽超出窗口时被 stretch 挤压成很窄一列
-            self.tree.column("路径", stretch=True, minwidth=420)
+            # 路径列不拉伸：宽度由 _autosize_columns 按最长路径测量，
+            # stretch=False 使超长路径时总列宽超出窗口、启用水平滚动条查看完整路径
+            self.tree.column("路径", stretch=False, minwidth=120)
         # 指标列宽度：按类型/名称给合理默认，允许拖拽调整
         for c in visible_metrics:
             if c in _SORTABLE_COLS:
@@ -346,15 +354,16 @@ class DBViewApp:
         cols = fixed_vis + visible_metrics
         self.cols = cols
         self.tree.configure(columns=cols)
-        base_widths = {"#": 45, "设备": 70, "月份": 75, "路径": 420,
+        base_widths = {"#": 45, "设备": 70, "月份": 75, "路径": 260,
                        "处理时间": 140}
         for c in fixed_vis:
             if c in _SORTABLE_COLS:
                 self.tree.heading(c, text=c, command=lambda c=c: self._on_heading_click(c))
             else:
                 self.tree.heading(c, text=c)
-            # 路径列设较大 minwidth 下限，避免多列挤压时被 stretch 缩成很窄一列
-            min_w = 420 if c == "路径" else 40
+            # 路径列 minwidth 仅防空路径塌陷；真实宽度由 _autosize_columns 按内容测量，
+            # 不再设大下限，否则 width<minwidth 时被强制撑开产生空白
+            min_w = 120 if c == "路径" else 40
             self.tree.column(c, width=base_widths[c], minwidth=min_w, anchor="w",
                              stretch=False)
         if "#" in cols:
@@ -362,7 +371,7 @@ class DBViewApp:
         if "大小" in cols:
             self.tree.column("大小", anchor="e")
         if "路径" in cols:
-            self.tree.column("路径", stretch=True)
+            self.tree.column("路径", stretch=False)
         for c in visible_metrics:
             if c in _SORTABLE_COLS:
                 self.tree.heading(c, text=c, command=lambda c=c: self._on_heading_click(c))
@@ -485,7 +494,7 @@ class DBViewApp:
             total = c.execute(count_sql, count_params).fetchone()[0]
             c.close()
         except sqlite3.Error as e:
-            messagebox.showerror("查询失败", str(e))
+            messagebox.showerror("查询失败", str(e), parent=self.root)
             return
 
         self._raw_rows = rows
@@ -557,7 +566,8 @@ class DBViewApp:
                     vals.append(row[col_index[c]])
                 else:                 # 指标列（含"大小"）
                     vals.append(row[col_index[c]])
-            self.tree.insert("", "end", values=tuple(vals))
+            self.tree.insert("", "end", values=tuple(vals),
+                              tags=("oddrow",) if i % 2 == 0 else ())
         total = getattr(self, "_total_count", len(rows))
         shown = len(rows)
         # 分页信息：当前页显示的行区间（相对全量）
@@ -583,23 +593,18 @@ class DBViewApp:
         import tkinter.font as tkfont
         # 缓存测量字体对象（避免每次重算都 new，进一步加速）
         if not hasattr(self, "_measure_font") or self._measure_font is None:
-            self._measure_font = tkfont.Font(font=("Microsoft YaHei", 10))
-            self._measure_head_font = tkfont.Font(font=("Microsoft YaHei", 9, "bold"))
+            # 测量字体与 Treeview 实际渲染字体一致（8 号）
+            self._measure_font = tkfont.Font(font=("Microsoft YaHei", 8))
+            self._measure_head_font = tkfont.Font(font=("Microsoft YaHei", 8, "bold"))
         font = self._measure_font
         head_font = self._measure_head_font
         PAD = 10          # 内容左右边距（贴合内容，避免右侧多余空白）
-        HEAD_PAD = 6      # 表头额外余量（给排序箭头 ▲/▼ 留位）
+        HEAD_PAD = 14     # 表头额外余量（给排序箭头 ▲/▼ 及点击留位，保证标题不被截断）
         MIN_W = 50        # 绝对下限：仅防止该列当前页几乎无内容时列过窄
         SAMPLE = 200      # 采样当前显示的前 200 行测宽度（更全面，仍毫秒级）
         for col in self.cols:
-            # 路径列随窗口拉伸，不自动收缩
-            if col == "路径":
-                continue
-            # 用户手动拖过的列保持其宽度
-            if col in self._manual_widths:
-                continue
-            # 表头宽度（中文 bold 测量偏保守，PAD 已含余量）
-            head_w = head_font.measure(col) + PAD + HEAD_PAD
+            # 表头宽度（中文 bold 测量偏保守，加排序箭头占位与余量）
+            head_w = head_font.measure(col) + head_font.measure("▲") + PAD + HEAD_PAD
             # 内容宽度：采样前若干行取最大值
             content_w = 0
             for iid in self.tree.get_children()[:SAMPLE]:
@@ -609,32 +614,37 @@ class DBViewApp:
                 w = font.measure(v) + PAD
                 if w > content_w:
                     content_w = w
-            # 列宽 = max(表头, 内容)，贴合实际；仅以 MIN_W 兜底防止塌陷
-            best = max(MIN_W, head_w, content_w)
-            # 设上限，避免过宽
-            best = min(best, 500)
+            if col == "路径":
+                # 路径列不设上限，按最长路径完整显示（stretch=False，超长时靠水平滚动条查看）
+                best = max(MIN_W, head_w, content_w)
+            else:
+                # 列宽取「表头标题」与「最长内容」的较大者，确保标题完整显示、
+                # 内容也不截断。不设 500 上限，否则长标题/长内容列会被压窄显示不全，
+                # 超长时靠底部水平滚动条查看完整内容。
+                best = max(head_w, content_w, MIN_W)
             self.tree.column(col, width=best)
+        # 注意：路径列保持 stretch=False，宽度严格贴合内容（由上面按最长路径测量）。
+        # 切不可把路径列设 stretch=True —— 那会把整列拉伸到填满窗口剩余宽度，
+        # 造成"路径文字短但列很宽、文字右边一大片空白"的观感。
+        # 长路径时总列宽会超出窗口，靠底部水平滚动条查看完整路径。
 
     def _on_col_resize(self):
-        """用户拖动表头分隔线改列宽后，记录该列，刷新时不再自动调整它。"""
-        # 检测哪些列当前宽度与自适应值不符（简单做法：记录所有非路径列）
-        # 用一个轻量检测：若鼠标在表头分隔线附近释放，则标记当前列
+        """用户拖动表头分隔线（separator）改列宽后，记录该列，刷新时不再自动调整它。
+
+        只认 `separator` 区域（真正的拖宽边界）。不认 `heading`——
+        否则点击表头排序也会把该列误加进 _manual_widths，导致它从此不再自适应
+        （字符多的路径/品名/原品名等被点过表头后即固定宽度、显示不符）。
+        """
         try:
-            # ttk.Treeview 没有直接给「哪列被拖」的事件，用identify
             x = self.tree.winfo_pointerx() - self.tree.winfo_rootx()
             y = self.tree.winfo_pointery() - self.tree.winfo_rooty()
-            region = self.tree.identify("region", x, y)
-            if region == "heading":
-                col = self.tree.identify_column(x)
-                # col 形如 "#3"，转成列名
-                idx = int(col[1:]) - 1
-                if 0 <= idx < len(self.cols):
-                    self._manual_widths.add(self.cols[idx])
-            elif region == "separator":
-                col = self.tree.identify_column(x)
-                idx = int(col[1:]) - 1
-                if 0 <= idx < len(self.cols):
-                    self._manual_widths.add(self.cols[idx])
+            if self.tree.identify("region", x, y) != "separator":
+                return
+            col = self.tree.identify_column(x)
+            # col 形如 "#3"，转成列名
+            idx = int(col[1:]) - 1
+            if 0 <= idx < len(self.cols):
+                self._manual_widths.add(self.cols[idx])
         except Exception:
             pass
 
@@ -983,10 +993,10 @@ class DBViewApp:
             rows = c.execute(sql, params).fetchall()
             c.close()
         except sqlite3.Error as e:
-            messagebox.showerror("导出失败", str(e))
+            messagebox.showerror("导出失败", str(e), parent=self.root)
             return
         if not rows:
-            messagebox.showinfo("导出", "当前筛选无数据，未导出。")
+            messagebox.showinfo("导出", "当前筛选无数据，未导出。", parent=self.root)
             return
 
         # 先让用户选择要导出的列
@@ -1030,9 +1040,9 @@ class DBViewApp:
                 w.writerow([header_of(n) for n in sel])
                 for i, row in enumerate(rows, 1):
                     w.writerow([value_of(n, i, row) for n in sel])
-            messagebox.showinfo("导出成功", f"已导出 {len(rows)} 行、{len(sel)} 列到：\n{fn}")
+            messagebox.showinfo("导出成功", f"已导出 {len(rows)} 行、{len(sel)} 列到：\n{fn}", parent=self.root)
         except Exception as e:
-            messagebox.showerror("导出失败", str(e))
+            messagebox.showerror("导出失败", str(e), parent=self.root)
 
 
 def open_db_view(parent=None):

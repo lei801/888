@@ -1043,15 +1043,26 @@ class ScannerApp:
             return
         _BATCH = 1000
         buf = []
+        total = len(paths)
+        done_cnt = 0
+        self.q.put(("status", "计算指标中…"))
+        self.q.put(("status_color", "#0a7d2c"))
+        # 计算指标时不再扫描文件夹，「当前扫描」框应离开『上一个文件夹』以免误以为还在扫那个目录
+        self.q.put(("current", "计算指标中…（%d 个文件）" % total))
         for p, res in analysis.compute_paths(paths, self._get_compute_workers(), stop_event):
             if stop_event is not None and stop_event.is_set():
                 break  # 用户停止：已算出的 buf 照常落库，剩余文件由『补算缺失指标』兜底
             buf.append((p, res))
+            done_cnt += 1
             if len(buf) >= _BATCH:
                 analysis.upsert_batch(self.conn, self.db_lock, buf)
                 buf = []
+                # 按批回传进度（每批刷新一次，避免逐文件刷 UI）
+                self.q.put(("status", "计算指标中… %d/%d" % (done_cnt, total)))
         if buf:
             analysis.upsert_batch(self.conn, self.db_lock, buf)
+            done_cnt = min(done_cnt, total)
+            self.q.put(("status", "计算指标中… %d/%d" % (done_cnt, total)))
 
     def open_recalc_dialog(self):
         """打开「重新计算指标」对话框：选择月份/设备（可多选）后后台重算。"""
@@ -1121,8 +1132,6 @@ class ScannerApp:
             # 不做每轮 listdir 自动发现，省去每轮 D 次顶层 isdir；选产线时也不必再枚举全历史目录。
             raw_targets = discover_backup_targets(
                 root_path, months, device_list=device_list, lines=lines)  # 直接按设备清单拼接目录（不探测存在性）
-            # structure_ok：设备备份结构是否可用（基于设备清单是否非空），不再依赖 isdir 探测结果
-            structure_ok = bool(device_list)
             targets = raw_targets
             device_mode = bool(targets)
             # 逐设备剔除「已确认」设备的上月目录：本月目录总是保留，上月目录仅保留
@@ -1146,14 +1155,15 @@ class ScannerApp:
                         extra = "（含上月兜底·逐设备确认）" if need_prev else ""
                         self.q.put(("log", "仅轮询当前月目录（共 %d 个设备目录）%s%s。"
                                      % (len(targets), extra, line_tag)))
-                elif structure_ok:
-                    # 设备备份结构认得出，但当前【产线/设备清单】筛选下本月无匹配目录
+                elif device_list:
+                    # 设备清单非空（结构认得出），但当前【产线/设备清单】筛选下本月无匹配目录
                     flt = ("产线 %s" % "/".join(lines)) if lines else "设备清单"
                     self.q.put(("log", "已识别设备备份结构，但【%s】筛选下本月无匹配目录，本轮跳过扫描。"
                                  % flt))
                 else:
-                    self.q.put(("log", "未识别到设备备份结构（{设备}/%s/BACKUP_YYYYMM），本轮跳过扫描。"
-                                 % CPU_SUBDIR))
+                    # 设备清单为空（未配置/丢失设备号），与“目录结构是否真实存在”无关
+                    self.q.put(("log", "设备清单为空（未配置设备号），本轮跳过扫描。"
+                                      "请先在【设置】中嗅探或填写设备清单。"))
             first_cycle = False
 
             # 重置本轮统计（候选/已处理/进度统一归零，避免无匹配目录时残留上一轮数据）
@@ -1202,6 +1212,8 @@ class ScannerApp:
                                  % len(new_paths)))
                 self.pending_rows = []
             self._save_config()
+            # 一轮正常完成（含计算指标）：清空「当前扫描」框，避免停留在『计算指标中…』或上一个文件夹
+            self.q.put(("current", "（无）"))
             if discovery_error:
                 self.q.put(("status", "出错（见上方日志）" + (" · 监控继续" if not backfill else "")))
                 self.q.put(("status_color", "#c00"))
