@@ -23,9 +23,11 @@ import csv
 import json
 import sqlite3
 import datetime
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import analysis
+import db_maintain   # 复用 run_maintain 做归档/瘦身（GUI 按钮触发，不再需命令行）
 from analysis import column_defs, join_clause, classify_line   # 指标列定义 / SQL JOIN 均来自 analysis
 
 # 分页设置（仅影响界面渲染，不影响 CSV 导出）
@@ -240,6 +242,7 @@ class DBViewApp:
 
         ttk.Button(frm2, text="重置筛选", command=self._reset_filters).grid(row=0, column=0, padx=(0, 0))
         ttk.Button(frm2, text="显示列", command=self._pick_visible_columns).grid(row=0, column=1, padx=(6, 0))
+        ttk.Button(frm2, text="归档旧数据", command=self._open_archive_dialog).grid(row=0, column=2, padx=(6, 0))
         ttk.Button(frm2, text="复制选中", command=self._copy_selected).grid(row=0, column=3, padx=(6, 0))
         ttk.Button(frm2, text="导出 CSV", command=self._export_csv).grid(row=0, column=4, padx=(6, 0))
 
@@ -984,6 +987,10 @@ class DBViewApp:
         dlg.lift()
         dlg.wait_window(dlg)
 
+    def _open_archive_dialog(self):
+        """打开归档设置对话框（可设保留月份、预览、手动/自动归档）。"""
+        ArchiveDialog(self.root, self)
+
     def _export_csv(self):
         sql, params, _count_sql, _count_params = self._query_sql()   # 导出不加 LIMIT，导出全部匹配行
         if sql is None:
@@ -1090,3 +1097,180 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+class ArchiveDialog(tk.Toplevel):
+    """归档设置对话框：设定保留月份、预览、手动/自动归档。"""
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self.title("归档旧数据设置")
+        self.resizable(False, False)
+        self.transient(parent)   # 置顶于父窗口并相对父窗口定位
+        self._auto_after_id = None
+        self._last_auto_run = 0.0
+        self._popup = True
+        self._build()
+        # 居中于父窗口（控件布局完成后再取尺寸，避免偏出主界面）
+        self.update_idletasks()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        x = max(0, px + (pw - w) // 2)
+        y = max(0, py + (ph - h) // 2)
+        self.geometry("+%d+%d" % (x, y))
+
+    def _build(self):
+        frm = ttk.Frame(self, padding=12)
+        frm.grid(sticky="nsew")
+
+        # 保留月份
+        ttk.Label(frm, text="保留最近月份数：").grid(row=0, column=0, sticky="w", pady=2)
+        self.km_var = tk.StringVar(value=str(db_maintain.KEEP_MONTHS))
+        ttk.Entry(frm, textvariable=self.km_var, width=8).grid(row=0, column=1, sticky="w", padx=6)
+        ttk.Label(frm, text="（数据月份 < 当前月 - 此值 的记录将被归档）").grid(row=0, column=2, sticky="w")
+
+        # 预览
+        ttk.Button(frm, text="预览将归档数量", command=self._preview).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=6)
+        self.prev_var = tk.StringVar(value="（点上方预览）")
+        ttk.Label(frm, textvariable=self.prev_var, foreground="#1a73e8").grid(
+            row=2, column=0, columnspan=3, sticky="w")
+
+        # 手动归档
+        ttk.Button(frm, text="立即归档（手动）", command=self._manual).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=6)
+
+        # 自动归档
+        self.auto_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(frm, text="启用自动归档", variable=self.auto_var,
+                        command=self._on_auto_toggle).grid(row=4, column=0, sticky="w")
+        ttk.Label(frm, text="检查频率(天)：").grid(row=4, column=1, sticky="w")
+        self.interval_var = tk.StringVar(value="1")
+        ttk.Entry(frm, textvariable=self.interval_var, width=6).grid(
+            row=4, column=2, sticky="w", padx=4)
+        ttk.Label(frm, text="（多久查一次是否超期；归档本身按「保留月份」条件触发，非定时）").grid(
+            row=5, column=0, columnspan=3, sticky="w")
+
+        self.auto_stat_var = tk.StringVar(value="自动归档：未启用")
+        ttk.Label(frm, textvariable=self.auto_stat_var, foreground="#666").grid(
+            row=6, column=0, columnspan=3, sticky="w")
+
+        ttk.Button(frm, text="关闭", command=self.destroy).grid(
+            row=7, column=2, sticky="e", pady=10)
+
+    def _valid_km(self):
+        try:
+            v = int(self.km_var.get())
+            if v < 1:
+                raise ValueError
+            return v
+        except Exception:
+            messagebox.showerror("参数错误", "保留月份数必须为正整数。", parent=self)
+            return None
+
+    def _valid_interval(self):
+        try:
+            v = float(self.interval_var.get())
+            if v < 1:
+                raise ValueError
+            return v
+        except Exception:
+            return 1.0
+
+    def _check_ms(self):
+        # 界面按「天」设置，转成毫秒（1 天 = 86400 秒）
+        return int(self._valid_interval() * 86400 * 1000)
+
+    def _preview(self):
+        km = self._valid_km()
+        if km is None:
+            return
+        old, keep, cut, no_ym = db_maintain.preview_old(km)
+        if cut is None:
+            self.prev_var.set("未找到数据库文件。")
+            return
+        self.prev_var.set("数据月份 < %s 将被归档：旧 %d 条，保留 %d 条%s"
+                          % (cut, old, keep,
+                             ("（其中 %d 条无月份保留）" % no_ym) if no_ym else ""))
+
+    def _manual(self):
+        km = self._valid_km()
+        if km is None:
+            return
+        if not messagebox.askyesno(
+                "确认归档",
+                "将归档数据月份 < 当前月 - %d 的记录并删除主库旧数据（先整库备份）。继续？"
+                % km, parent=self):
+            return
+        self._run_archive(km, popup=True)
+
+    def _run_archive(self, km, popup):
+        self._popup = popup
+        self.config(cursor="watch")
+        logs = []
+
+        def _worker():
+            try:
+                summary = db_maintain.run_maintain(log_cb=logs.append, keep_months=km)
+            except Exception as e:
+                summary = "归档出错：%s" % e
+                logs.append(summary)
+            self.after(0, self._on_done, summary, logs)
+
+        import threading
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_done(self, summary, logs):
+        self.config(cursor="")
+        try:
+            self.app._refresh()
+        except Exception:
+            pass
+        tail = "\n".join(logs[-6:])
+        if self._popup:
+            messagebox.showinfo("归档结果", "%s\n\n%s" % (summary, tail), parent=self)
+        else:
+            self.auto_stat_var.set("上次自动归档：%s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+
+    def _on_auto_toggle(self):
+        if self.auto_var.get():
+            self._schedule_auto()
+        else:
+            self._cancel_auto()
+            self.auto_stat_var.set("自动归档：未启用")
+
+    def _schedule_auto(self):
+        self._cancel_auto()
+        self._auto_tick()
+
+    def _cancel_auto(self):
+        if self._auto_after_id is not None:
+            self.after_cancel(self._auto_after_id)
+            self._auto_after_id = None
+
+    def _auto_tick(self):
+        km = self._valid_km()
+        if km is None:
+            self.auto_var.set(False)
+            self.auto_stat_var.set("自动归档：参数错误已停用")
+            return
+        ms = self._check_ms()
+        try:
+            old_cnt, _keep, _cut, _no_ym = db_maintain.preview_old(km)
+        except sqlite3.Error as e:
+            self.auto_stat_var.set("自动检查出错：%s" % e)
+            self._auto_after_id = self.after(ms, self._auto_tick)
+            return
+        if old_cnt > 0:
+            # 存在超过保存月数的数据 → 归档（而非按固定周期无脑执行）
+            self.auto_stat_var.set("发现 %d 条超期数据，已触发归档…" % old_cnt)
+            self._run_archive(km, popup=False)
+        else:
+            self.auto_stat_var.set("当前无超期数据，无需归档（检查频率 %d 天）" % int(self._valid_interval()))
+        self._auto_after_id = self.after(ms, self._auto_tick)
+
+    def destroy(self):
+        self._cancel_auto()
+        super().destroy()

@@ -75,6 +75,9 @@ _DEFAULT_CONFIG = {
     # 计算指标并行线程数：历史回填/重新计算/补算缺失共用；1=不并行，网络盘可适当调大
     "compute_workers": 4,
     "device_list": [],   # 设备清单：首次运行由扫描路径嗅探并持久化；之后直接拼路径省去每轮 listdir
+    # 监控阶段 mtime 优先缓存：目录路径 -> 上轮记录到的 mtime（浮点秒）。
+    # 仅监控阶段使用；回填（历史全量）始终全量 scandir，不经此缓存。
+    "dir_mtime_cache": {},
 }
 
 
@@ -142,12 +145,6 @@ def load_config() -> dict[str, Any]:
     """从 scan_state.ini 读取配置；缺失项用 _DEFAULT_CONFIG 补齐。"""
     cfg: dict[str, Any] = dict(_DEFAULT_CONFIG)
     cfg.update(_read_ini())
-    cfg.pop("overlap_days", None)  # 旧版「跨月重叠天数」已废弃（改为上月确认机制），载入时丢弃
-    cfg.pop("last_prev_confirmed_ym", None)  # 旧版「全局上月确认标志」已废弃（改为逐设备确认），载入时丢弃
-    cfg.pop("prev_scan_days", None)  # 旧版「月初兜底天数」已废弃（改为 prev_scan_hours 小时窗口），载入时丢弃
-    cfg.pop("prev_abandoned", None)  # 旧版「放弃兜底清单」已废弃（窗口外自然停扫，无需记忆），载入时丢弃
-    cfg.pop("prev_confirmed", None)  # 逐设备上月确认标志已改内存态（仅月初窗口期用），不再持久化，丢弃旧 ini 残留
-    cfg.pop("history_done", None)  # 历史回填完成标志：代码早已不读写，属历史残留，载入时丢弃
     return cfg
 
 
@@ -156,11 +153,29 @@ def save_config(cfg: dict[str, Any], lock: threading.Lock | None = None) -> None
     _write_ini(cfg)
 
 
-def load_processed_set(conn, lock: threading.Lock | None = None) -> set[str]:
-    """加载全部已处理路径到内存集合（用于 O(1) 去重判定）。"""
+def load_processed_set_for_targets(conn, targets: list[str],
+                                   lock: threading.Lock | None = None) -> set[str]:
+    """仅加载「本轮目标目录」下的已处理路径（窗口化去重集）。
+
+    正常监控下 targets 只含当前月(+月初窗口内的上月兜底)，故内存恒定在
+    当月量级（约 30~60 万条），而不再全量载入全年记录（可上千万条）。
+    历史去重语义不变：本轮仅会枚举这些目录里的文件，历史目录本轮根本不扫，
+    无需为它们保留去重信息。
+
+    targets 中的目录路径与库内 path 同分隔符（OS 原生），按 'dir/%(或\\%)' 前缀匹配。
+    path 列为 UNIQUE（有索引），'prefix%' 形式的 LIKE 可命中索引前缀匹配。
+    """
     cm = lock if lock is not None else _nullcontext()
+    if not targets:
+        return set()
     with cm:
-        return set(r[0] for r in conn.execute("SELECT path FROM processed"))
+        out: set[str] = set()
+        for d in targets:
+            prefix = d.rstrip("\\/") + os.sep  # 尾部分隔符，保证匹配目录内文件而非同名前缀目录
+            # SQLite LIKE 视 % 为通配；目录路径本身通常不含 %/_，无需转义
+            for (p,) in conn.execute("SELECT path FROM processed WHERE path LIKE ?", (prefix + "%",)):
+                out.add(p)
+        return out
 
 
 _DEV_RE = re.compile(r"[\\/]([^\\/]+)[\\/]")
@@ -212,7 +227,7 @@ def reset_processed_db(conn, lock: threading.Lock | None = None) -> None:
 
 # -------------------------- 文件遍历（os.scandir 递归，性能优于 os.walk） --------------------------
 def _safe_stat(path, fn, timeout=5.0):
-    """带超时执行 os.path.isdir/isfile 等 stat：网络盘不可达目录的 stat 可能永久挂起，
+    """带超时执行 os.path.isdir/isfile 等 stat：网络盘无响应目录的 stat 可能永久挂起，
     用子线程 + join(timeout) 兜底，超时返回 False（视为不可访问、跳过，避免永久卡死）。"""
     res = {}
     def _w():
@@ -229,7 +244,7 @@ def _safe_stat(path, fn, timeout=5.0):
 
 
 def _safe_scandir(root, timeout=15.0):
-    """带超时的 os.scandir：不可达目录超时抛 OSError 由调用方上报，避免永久挂起卡死。"""
+    """带超时的 os.scandir：无响应目录超时抛 OSError 由调用方上报，避免永久挂起卡死。"""
     res, err = {}, {}
     def _w():
         try:
@@ -240,7 +255,7 @@ def _safe_scandir(root, timeout=15.0):
     th.start()
     th.join(timeout)
     if th.is_alive():
-        raise OSError("scandir 超时（目录可能不可达）：%s" % root)
+        raise OSError("scandir 超时（目录可能无响应）：%s" % root)
     if "e" in err:
         raise err["e"]
     return res["it"]
@@ -370,12 +385,7 @@ class ScannerApp:
         # 逐设备上月确认标志（内存态，仅月初窗口期用）：{设备号: 已确认到的月份YYYYMM}。
         # 不持久化——窗口外本就不读它；窗口内重启仅首轮多扫一次上月目录、当轮即全部重新确认，无漏扫。
         self._prev_confirmed: dict[str, str] = {}
-        self.processed_set: set[str] = load_processed_set(self.conn, self.db_lock)  # 已处理路径集合
-        # 各文件夹累计文件数：增量维护（新增时 +1、重置时清空），避免每轮扫描遍历全量集合 O(N)
-        self.folder_counts: dict[str, int] = {}
-        for _p in self.processed_set:
-            _d = os.path.dirname(_p)
-            self.folder_counts[_d] = self.folder_counts.get(_d, 0) + 1
+        self.processed_set: set[str] = set()  # 本轮去重集（每轮按 targets 窗口化重建，见 _run）
         self.pending_rows: list[tuple[Any, ...]] = []           # 本轮待写入 DB 的新增记录
         self.thread = None
         self.pause_event = threading.Event()
@@ -488,7 +498,7 @@ class ScannerApp:
                                       textvariable=self.start_month_var, wrap=True,
                                       format="%02.0f")
         self.spin_month.grid(row=0, column=3, sticky="w", padx=(2, 2))
-        ttk.Label(frm_ym, text="月（含；「历史回填」从该月回溯到当前月）").grid(row=0, column=4, sticky="w")
+        ttk.Label(frm_ym, text="月").grid(row=0, column=4, sticky="w")
         # 历史回填按钮与起始月份同一行
         self.btn_backfill = ttk.Button(frm_ym, text="历史回填", command=self.history_backfill)
         self.btn_backfill.grid(row=0, column=5, sticky="w", padx=(16, 0))
@@ -500,7 +510,7 @@ class ScannerApp:
         self.poll_var = tk.StringVar(value=str(self.state.get("poll_interval", 20)))
         self.entry_poll = ttk.Entry(frm_poll1, textvariable=self.poll_var, width=8)
         self.entry_poll.pack(side="left", padx=(4, 2))
-        ttk.Label(frm_poll1, text="秒（默认 20）").pack(side="left")
+        ttk.Label(frm_poll1, text="秒").pack(side="left")
         ttk.Label(frm_poll1, text="跨月兜底：").pack(side="left", padx=(14, 0))
         self.prev_hours_var = tk.StringVar(value=str(self.state.get("prev_scan_hours", 6)))
         self.entry_prev_hours = ttk.Entry(frm_poll1, textvariable=self.prev_hours_var, width=5)
@@ -513,16 +523,10 @@ class ScannerApp:
         # 第二行：产线 + 计算 + 设备清单
         frm_poll2 = ttk.Frame(frm_settings, padding=(2, 2, 2, 6))
         frm_poll2.pack(fill="x")
-        ttk.Label(frm_poll2, text="产线(可复选):").pack(side="left")
+        ttk.Label(frm_poll2, text="产线:").pack(side="left")
         line_box = ttk.Frame(frm_poll2)
         line_box.pack(side="left", padx=(4, 2))
-        # 兼容旧配置：单值 scan_line 迁移为 scan_lines 列表（空=不限）
-        _lines_cfg = self.state.get("scan_lines")
-        if _lines_cfg is None:
-            _old = self.state.get("scan_line")
-            _lines_cfg = [] if _old in (None, "", "（不限）") else [_old]
-            self.state["scan_lines"] = _lines_cfg
-        self.state.pop("scan_line", None)  # 迁移后旧单值键不再使用，移出 state 避免被全量重写回 ini
+        _lines_cfg = self.state.get("scan_lines", [])
         self.line_vars = {}
         for _ln in ("E", "C", "D", "A"):
             _v = tk.BooleanVar(value=_ln in _lines_cfg)
@@ -721,13 +725,9 @@ class ScannerApp:
         self.done_var = tk.StringVar(value="0")
         ttk.Label(frm_stat, textvariable=self.done_var).grid(row=0, column=5, sticky="w")
 
-        ttk.Label(frm_stat, text="累计已记录：").grid(row=1, column=0, sticky="w")
-        self.total_var = tk.StringVar(value=str(len(self.processed_set)))
-        ttk.Label(frm_stat, textvariable=self.total_var).grid(row=1, column=1, sticky="w")
-
-        ttk.Label(frm_stat, text="上次扫描：").grid(row=1, column=2, sticky="w")
+        ttk.Label(frm_stat, text="上次扫描：").grid(row=1, column=0, sticky="w")
         self.last_var = tk.StringVar(value=self._fmt_time(self.state.get("last_scan_time", 0)))
-        ttk.Label(frm_stat, textvariable=self.last_var).grid(row=1, column=3, sticky="w")
+        ttk.Label(frm_stat, textvariable=self.last_var).grid(row=1, column=1, sticky="w")
 
         # --- 进度条（独立一行，避免压住状态栏文字）---
         self.progress = ttk.Progressbar(root, orient="horizontal", mode="determinate", maximum=100)
@@ -742,10 +742,9 @@ class ScannerApp:
         hours_into_month = now.tm_hour + 24 * (now.tm_mday - 1)
         if hours_into_month > self.state.get("prev_scan_hours", 6):
             return False  # 窗口外：本月无生产的设备上月也不会有新文件，自然停扫
-        devs = self.state.get("device_list") or []
+        return True  # 窗口内：带扫上月（逐设备确认在 _run 中按 _prev_confirmed 剔除已确认设备）
 
     def _refresh_from_state(self):
-        self.total_var.set(str(len(self.processed_set)))
         self.last_var.set(self._fmt_time(self.state.get("last_scan_time", 0)))
         devs = self.state.get("device_list") or []
         line = self.state.get("scan_lines", [])
@@ -1000,14 +999,13 @@ class ScannerApp:
         if self.thread and self.thread.is_alive():
             messagebox.showwarning("请先停止", "扫描进行中，请先「停止」再重置状态。")
             return
-        n = len(self.processed_set)
+        n = self.conn.execute("SELECT COUNT(*) FROM processed").fetchone()[0]
         self.processed_set = set()
-        self.folder_counts = {}                 # 累计计数随集合一并清空
         self.pending_rows = []
         reset_processed_db(self.conn, self.db_lock)
+        save_config(self.state, self.db_lock)   # 持久化清空后的 mtime 缓存
         self.state["last_scan_time"] = 0
         self._save_config()
-        self.total_var.set("0")
         self.last_var.set(self._fmt_time(0))
         self.cand_var.set("0")
         self.done_var.set("0")
@@ -1098,6 +1096,11 @@ class ScannerApp:
         start_year = self.state.get("start_year", 2025)
         start_month = self.state.get("start_month", 1)
         first_cycle = True
+        enumerated_dirs = 0   # 本轮实际枚举目录数（无匹配目录时保持 0）
+        skip_cnt = 0          # 本轮被 mtime 跳过目录数
+        changed_cnt = 0       # 本轮有变化/保守枚举的目录数（无匹配目录时保持 0）
+        new_cnt = 0           # 本轮新出现目录数（无匹配目录时保持 0）
+        missing_cnt = 0       # 本轮不存在/无目录数（无匹配目录时保持 0）
 
         self.q.put(("status", "监控中…"))
         self.q.put(("status_color", "#0a0"))
@@ -1146,15 +1149,23 @@ class ScannerApp:
             matched_devs = sorted({_dev_ym(t)[0] for t in targets}) if lines else []
             if first_cycle:
                 if device_mode:
+                    _pm = prev_ym(cur_ym)
+                    _cur_cnt = sum(1 for t in targets if _dev_ym(t)[1] == cur_ym)
+                    _prev_cnt = sum(1 for t in targets if _dev_ym(t)[1] == _pm)
                     line_tag = (" · 按产线 %s 命中设备：%s"
                                 % ("/".join(lines), "、".join(matched_devs))) if lines else ""
                     if backfill:
                         self.q.put(("log", "历史回填：从 %04d%02d 到当前月，跨 %d 个月、%d 个设备目录。%s"
                                      % (start_year, start_month, len(months), len(targets), line_tag)))
                     else:
-                        extra = "（含上月兜底·逐设备确认）" if need_prev else ""
-                        self.q.put(("log", "仅轮询当前月目录（共 %d 个设备目录）%s%s。"
-                                     % (len(targets), extra, line_tag)))
+                        if need_prev and _prev_cnt > 0:
+                            extra = "（含上月兜底 %d 个 · 逐设备确认）" % _prev_cnt
+                        elif need_prev and _prev_cnt == 0:
+                            extra = "（上月已确认 · 仅扫本月）"
+                        else:
+                            extra = ""
+                        self.q.put(("log", "轮询当前月 %d 个设备目录%s%s。"
+                                     % (_cur_cnt, extra, line_tag)))
                 elif device_list:
                     # 设备清单非空（结构认得出），但当前【产线/设备清单】筛选下本月无匹配目录
                     flt = ("产线 %s" % "/".join(lines)) if lines else "设备清单"
@@ -1172,8 +1183,17 @@ class ScannerApp:
             self.q.put(("progress", 0))
             # 有匹配目录时只扫命中的设备目录；无匹配时本轮跳过扫描（不回退递归全量扫描）
             if targets:
-                scanned, total, done, discovery_error = self._scan_cycle(
-                    targets, root_path, current_months)
+                # 窗口化重建去重集：只装「本轮目标目录」下的已处理路径，内存恒定当月
+                # 量级（约 30~60 万条），而非全量载入全年记录。历史目录本轮不扫，无需其去重信息。
+                self.processed_set = load_processed_set_for_targets(
+                    self.conn, targets, self.db_lock)
+                # 监控阶段用 mtime 优先；回填阶段始终全量。全量兜底已由「月初 6 小时
+                # 窗口内逐设备上月兜底/确认」承担（prev_scan_hours），此处不再额外强制全量。
+                force_full = False
+                scanned, total, done, discovery_error, mstats = self._scan_cycle(
+                    targets, root_path,
+                    backfill=backfill, force_full=force_full)
+                enumerated_dirs, skip_cnt, changed_cnt, new_cnt, missing_cnt = mstats
             else:
                 scanned, total, done, discovery_error = 0, 0, 0, None
                 # 跳过扫描时也刷新统计面板，避免残留上一产线/上一轮的数据
@@ -1212,13 +1232,21 @@ class ScannerApp:
                                  % len(new_paths)))
                 self.pending_rows = []
             self._save_config()
+            # mtime 监控摘要：每轮都报三类目录情况（新增候选数由上方「已枚举 N 个文件，新增候选 X 个」呈现）。
+            # 恒等：总目录 == 跳过 + 无目录 + 枚举，方便核对三类统计是否守恒。
+            if not backfill:
+                self.q.put(("log", "总目录%d 跳过%d 无目录%d 枚举%d"
+                                   % (len(targets), skip_cnt, missing_cnt, enumerated_dirs)))
             # 一轮正常完成（含计算指标）：清空「当前扫描」框，避免停留在『计算指标中…』或上一个文件夹
             self.q.put(("current", "（无）"))
             if discovery_error:
                 self.q.put(("status", "出错（见上方日志）" + (" · 监控继续" if not backfill else "")))
                 self.q.put(("status_color", "#c00"))
             elif total == 0:
-                self.q.put(("status", ("本轮完成（无新增）· 监控中" if not backfill else "历史回填完成（无新增）")))
+                if not backfill and skip_cnt == len(targets) and len(targets) > 0:
+                    self.q.put(("status", "本轮全部目录未变化，已跳过（轮询 0）· 监控中"))
+                else:
+                    self.q.put(("status", ("本轮完成（无新增）· 监控中" if not backfill else "历史回填完成（无新增）")))
                 self.q.put(("status_color", "#0a0"))
             else:
                 self.q.put(("status", ("本轮完成（处理 %d 个）· 监控中" % done) if not backfill
@@ -1236,22 +1264,64 @@ class ScannerApp:
         self.q.put(("status_color", "#c80" if not backfill else "#0a0"))
         self.q.put(("finished", 1 if backfill else 0))
 
-    def _scan_cycle(self, targets, root_path, current_months=None):
+    def _scan_cycle(self, targets, root_path,
+                    backfill=False, force_full=False):
         """执行【一轮】扫描：发现候选 + 逐个处理。
         targets: 设备备份目录列表（如 [{设备}/CPU1/BACKUP_YYYYMM, ...]）；为 None 时回退为
-                 对整个 root_path 递归全量扫描（通用模式）。
-        返回 (scanned, total, done, discovery_error)。"""
+                对整个 root_path 递归全量扫描（通用模式）。
+        backfill: True=历史回填，始终全量 scandir（不经 mtime 缓存）；False=监控阶段。
+        force_full: 监控阶段为 True 时忽略 mtime 缓存、强制全量 scandir 一次兜底（防漏扫）。
+        返回 (scanned, total, done, discovery_error, mstats)；
+        mstats=(enumerated_dirs, skip_cnt, changed_cnt, new_cnt, missing_cnt)：
+        监控阶段——enumerated_dirs=实际枚举目录数、skip_cnt=mtime 未变跳过数、
+        changed_cnt=缓存有记录且 mtime 变化数、new_cnt=缓存无记录新出现数、
+        missing_cnt=不存在/无目录数；
+        回填/强制全量阶段枚举数=目录数、跳过数=0。
+        恒等关系：len(targets) == enumerated_dirs + skip_cnt + missing_cnt（监控阶段）。"""
         candidates = []
         scanned = 0          # 实际枚举到的文件总数（用于诊断“为什么 0 候选”）
         discovery_error = None
         new_per_folder = {}  # 本次扫描新增：文件夹 -> 新增文件数
-        polled_folders = set()  # 本轮实际轮询（枚举）到的文件夹
+        # 统计列的“目录->文件数”仅统计本轮实际枚举到的文件（即 mtime 变化的目录），不跨轮累计。
+        folder_counts: dict[str, int] = {}
         last_folder = None
+        mtime_cache = self.state.setdefault("dir_mtime_cache", {})
+        updated_mtime = {}    # 本轮实际枚举到的目录 -> 新 mtime（仅监控阶段回写缓存）
+        skip_cnt = 0          # 监控阶段因 mtime 未变而跳过的目录数（诊断用）
+        missing_cnt = 0       # 目录不存在/无目录（stat 失败）的目录数，单独计“无目录”
+        enumerated_dirs = 0   # 实际枚举（未跳过）的目录数
+        changed_dirs = []     # 缓存有记录且 mtime 变化（或 stat 失败保守枚举）的目录
+        new_dirs = []         # 缓存无记录、首次出现（本轮才有的目录）
         # 扫描范围：targets 为目录列表时逐个目录扫；为 None 时递归整个 root_path
         scan_roots = targets if targets is not None else [root_path]
+        missing_devs: set[tuple[str, str]] = set()   # 本轮不存在目标：(设备号, 年月)，去重合并一行日志
         for scan_root in scan_roots:
+            # 监控阶段（非回填、非强制全量）：先 stat 取 mtime，与缓存比较，未变则跳过枚举。
+            # mtime 优先：省去未变目录的 scandir 网络往返；回填/兜底轮不跳过。
+            if not backfill and not force_full:
+                m = _safe_stat(scan_root, os.path.getmtime, timeout=5.0)
+                if m is False or m is None:
+                    # 目录不存在 / 无目录（stat 失败）：单独计“无目录”，不写 mtime 缓存、不计入跳过
+                    missing_cnt += 1
+                    _d, _ym = _dev_ym(scan_root)
+                    missing_devs.add((_d, _ym))  # 记设备号+年月，循环后合并一行输出
+                    continue
+                if m == mtime_cache.get(scan_root):
+                    skip_cnt += 1
+                    continue          # mtime 未变：跳过该目录的 scandir
+                # mtime 变了 / 首次无缓存 → 计为变化或新目录，继续枚举
+                updated_mtime[scan_root] = m
+                if scan_root in mtime_cache:
+                    changed_dirs.append(scan_root)   # 缓存有旧值且变化
+                else:
+                    new_dirs.append(scan_root)       # 缓存无记录：首轮或新出现目录
             # 目录存在性不再逐目录探测（直接按设备清单拼接路径）；不存在的目录在 iter_files
             # 内部 scandir 重试失败后会被捕获，这里仅记录日志并跳过本轮该目录的枚举。
+            if scan_root in changed_dirs:
+                self.q.put(("log", "目录变化（枚举）：%s" % scan_root))
+            elif scan_root in new_dirs:
+                self.q.put(("log", "新目录（枚举）：%s" % scan_root))
+            enumerated_dirs += 1
             self.q.put(("current", "🔍 开始枚举: " + scan_root))
             try:
                 for fpath, entry in iter_files(scan_root, retries=1,
@@ -1261,31 +1331,47 @@ class ScannerApp:
                     scanned += 1
                     # 仅当所在文件夹变化时更新“当前扫描”，避免逐文件刷屏
                     folder = os.path.dirname(fpath)
-                    polled_folders.add(folder)  # 记录本轮实际轮询到的文件夹
+                    # 本轮枚举到的文件计入所在目录文件数（仅反映本轮 mtime 变化的目录）。
+                    folder_counts[folder] = folder_counts.get(folder, 0) + 1
                     if folder != last_folder:
                         self.q.put(("current", folder))
                         last_folder = folder
                     if scanned % 500 == 0:
                         self.q.put(("status", "发现中… 已枚举 %d 个文件" % scanned))
-                    # 方案A：仅凭文件名去重，不再调用 entry.stat()（省去每个文件的额外网络往返）
+                    # 仅凭文件名去重，不再调用 entry.stat()（省去每个文件的额外网络往返）
                     # candidates 为单元素元组 (fpath,)，size 改由「计算指标」阶段写入 metrics
                     if is_candidate(fpath, self.processed_set):
                         candidates.append((fpath,))
             except Exception as e:
-                discovery_error = e
                 if getattr(e, "winerror", None) == 3 or "系统找不到" in str(e) or "No such file" in str(e):
-                    self.q.put(("log", "目录不存在，本轮跳过：%s" % scan_root))
+                    enumerated_dirs -= 1   # 目录根本不存在，未真正枚举，不计入轮询数
+                    missing_cnt += 1       # 计入“无目录”
+                    _d, _ym = _dev_ym(scan_root)
+                    missing_devs.add((_d, _ym))  # 记设备号+年月，循环后合并一行输出
+                    # 目录不存在属确定失败（设备当月目录尚未生成），不视为致命错误，
+                    # 否则会污染 discovery_error 并阻止其他目录的 mtime 缓存回写。
                 else:
+                    discovery_error = e
                     self.q.put(("log", "发现阶段出错：%s" % e))
                     self.q.put(("status_color", "#c00"))
             if self.stop_event.is_set():
                 break
-
-        # 按产线筛选候选文件（通用递归模式 / 无设备结构的路径，按文件路径中的设备号归类后过滤）
-        lines = self.state.get("scan_lines", [])
-        if lines:
-            candidates = [c for c in candidates
-                          if analysis.classify_line(_dev_ym(c[0])[0]) in lines]
+        # 目标不存在的（设备·年月）合并为一行输出，不逐个打印完整路径，且能定位到缺失月份
+        if missing_devs:
+            _tags = sorted("%s·%s" % (d, ym) for d, ym in missing_devs)
+            self.q.put(("log", "目标不存在，本轮跳过：%s" % "、".join(_tags)))
+        # 监控阶段：本轮回写“实际枚举成功”的目录 mtime（updated_mtime 已排除报错/不存在目录），
+        # 跳过项沿用旧缓存，保持“未变”语义。与 discovery_error 解耦：个别目录不存在/报错
+        # 不再阻止其他目录的 mtime 缓存建立，否则缓存永建不起来、mtime 跳过永远不生效。
+        if not backfill:
+            if not self.stop_event.is_set():
+                mtime_cache.update(updated_mtime)
+                self.state["dir_mtime_cache"] = mtime_cache
+            if changed_dirs:
+                self.q.put(("log", "%d 个目录有变化，已枚举。" % len(changed_dirs)))
+            if new_dirs:
+                self.q.put(("log", "%d 个新目录（原无记录），已枚举。" % len(new_dirs)))
+        mstats = (enumerated_dirs, skip_cnt, len(changed_dirs), len(new_dirs), missing_cnt)
 
         total = len(candidates)
         self.q.put(("cand", total))
@@ -1318,8 +1404,7 @@ class ScannerApp:
             # 扫到的新文件名直接处理（不做写完判定，无额外网络 I/O）
             ts = time.strftime("%Y-%m-%d %H:%M:%S")
             self.processed_set.add(fpath)                 # 内存集合：O(1) 去重
-            self.folder_counts[folder] = self.folder_counts.get(folder, 0) + 1  # 同步累计计数
-            self.pending_rows.append((fpath, ts))  # 待落盘（方案A：不取 size/mtime；size 在算指标时入 metrics）
+            self.pending_rows.append((fpath, ts))  # 待落盘（不取 size/mtime；size 在算指标时入 metrics）
             done += 1
             new_per_folder[folder] = new_per_folder.get(folder, 0) + 1
             self.q.put(("done_count", done))
@@ -1330,24 +1415,16 @@ class ScannerApp:
         if total > 0 and not self.stop_event.is_set():
             self.q.put(("progress", 100))
 
-        # 各文件夹【当前累计文件数】：直接读增量维护的 folder_counts（O(1)，每轮不再遍历全量集合）
-        total_per_folder = self.folder_counts
-        # 统计框展示规则（修复“选产线放宽历史枚举后刷满全历史文件夹”的问题）：
-        #  - 当前月 / 待确认的上月 轮询到的文件夹：总是列出（含新增 0，这是用户关心的“本轮活动”）。
-        #  - 更早的历史月份目录（仅因选产线被放宽枚举而来）：仅在有新增时才列出，避免刷屏。
-        #  - 任何有新增的文件夹都列出（含历史月新增）。
-        cur = current_months or set()
-        folders_to_show = set()
-        for d in polled_folders:
-            _, ym = _dev_ym(d)
-            if ym in cur:
-                folders_to_show.add(d)
-        folders_to_show |= set(new_per_folder.keys())
+        # 各文件夹【实际文件数】：仅本轮枚举到的（mtime 变化的目录）文件数。
+        total_per_folder = folder_counts
+        # 展示范围：仅本轮枚举到的目录；若本轮没有任何目录被枚举（全部 mtime 未变被跳过），
+        # 则统计列为空，界面显示“本轮未轮询到文件夹”。
+        folders_to_show = set(folder_counts.keys())
         summary = {d: (total_per_folder.get(d, 0), new_per_folder.get(d, 0))
                    for d in folders_to_show}
         self.q.put(("folders", summary))
 
-        return scanned, total, done, discovery_error
+        return scanned, total, done, discovery_error, mstats
 
 
     def _wait_until_next(self):
@@ -1404,7 +1481,6 @@ class ScannerApp:
                     else:  # 主动停止：红字
                         self._set_title("已停止", "stop")
                         self.lbl_status.config(foreground="#c00000")
-                    self.total_var.set(str(len(self.processed_set)))
                     self.last_var.set(self._fmt_time(self.state.get("last_scan_time", 0)))
                     self.cur_var.set("（无）")
         except Empty:
@@ -1453,7 +1529,7 @@ class ScannerApp:
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
 
 
-    # ---------- 通用可折叠面板（方案 A：一次定义，点箭头按钮展开/收起） ----------
+    # ---------- 通用可折叠面板（一次定义，点箭头按钮展开/收起） ----------
     def _make_collapsible(self, parent, title, row, expanded=True, pady=(4, 4)):
         """创建一个点击箭头按钮展开/收起的折叠区块。
 
@@ -2439,8 +2515,17 @@ class DeviceListDialog(tk.Toplevel):
             self.status.config(text="请先在上方设置有效的扫描路径，再嗅探。")
             return
         try:
-            devs = sorted(d for d in os.listdir(root)
-                          if os.path.isdir(os.path.join(root, d)))
+            # 用带超时的 scandir 单次枚举（网络盘避免 listdir+逐个 isdir 的 N 次往返），
+            # DirEntry.is_dir() 走缓存、基本不额外走网络；单个条目失败跳过，不拖累整体。
+            it = _safe_scandir(root)
+            devs = []
+            for e in it:
+                try:
+                    if e.is_dir(follow_symlinks=False):
+                        devs.append(e.name)
+                except OSError:
+                    continue
+            devs.sort()
         except OSError as e:
             self.status.config(text="嗅探失败：%s" % e)
             return

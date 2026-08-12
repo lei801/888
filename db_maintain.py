@@ -57,25 +57,40 @@ def ym_lit_to_months(ym: int) -> int:
     return y * 12 + (m - 1)
 
 
-def main():
+def run_maintain(log_cb=None, keep_months=None):
+    """执行数据库维护：备份 + 补列 + 归档超期旧数据 + 主库瘦身。
+
+    log_cb: 可选回调，接收一条进度文本（用于 GUI 实时显示）。
+    keep_months: 保留最近多少个月（默认用模块 KEEP_MONTHS）。
+    返回最后的汇总文本。
+    """
+    km = keep_months if keep_months else KEEP_MONTHS
+
+    def _log(msg):
+        if log_cb:
+            log_cb(msg)
+        else:
+            print(msg)
+
+    ts = datetime.date.today().strftime("%Y%m%d")
     if not os.path.isfile(DB):
-        print("未找到", DB)
-        return
+        _log("未找到 %s" % DB)
+        return "未找到数据库文件"
 
     # 1) 全量备份
-    full_bak = os.path.join(HERE, f"scan_state_backup_{TS}.db")
+    full_bak = os.path.join(HERE, "scan_state_backup_%s.db" % ts)
     shutil.copy2(DB, full_bak)
-    print(f"[1/5] 全量备份 -> {full_bak}")
+    _log("[1/5] 全量备份 -> %s" % full_bak)
 
     conn = sqlite3.connect(DB)
     conn.execute("PRAGMA journal_mode=WAL")
-    analysis.ensure_tables(conn)   # 确保 metrics 宽表存在（数据库会重置，仅干净建表）
+    analysis.ensure_tables(conn)   # 确保 metrics 宽表存在
     cur = conn.cursor()
 
-    # 2) 回填 device/ym（主库 processed 表由主程序 ensure 建好，已含这两列；此处兜底确保列存在）
+    # 2) 回填 device/ym（主库已含这两列时 ALTER 会跳过；此处兜底）
     for col in ("device", "ym"):
         try:
-            cur.execute(f"ALTER TABLE processed ADD COLUMN {col} TEXT")
+            cur.execute("ALTER TABLE processed ADD COLUMN %s TEXT" % col)
         except sqlite3.OperationalError:
             pass  # 已存在
     rows = cur.execute("SELECT path, device, ym FROM processed").fetchall()
@@ -89,10 +104,10 @@ def main():
     if upd:
         cur.executemany("UPDATE processed SET device=?, ym=? WHERE path=?", upd)
     conn.commit()
-    print(f"[2/5] 已补/回填 device、ym 列，更新 {len(upd)} 行")
+    _log("[2/5] 已补/回填 device、ym 列，更新 %d 行" % len(upd))
 
-    # 3) 计算裁剪边界，分离旧记录（统一用『距公元的月数』比较，避免 YYYYMM 字面量与月份数混用）
-    cutoff_months = cur_ym_int() - KEEP_MONTHS
+    # 3) 计算裁剪边界，分离旧记录（统一用『距公元的月数』比较）
+    cutoff_months = cur_ym_int() - km
     cy, cm = divmod(cutoff_months, 12)
     cutoff_ym_lit = cy * 100 + (cm + 1)   # 转回 YYYYMM 便于阅读
     all_rows = cur.execute(
@@ -111,13 +126,13 @@ def main():
         else:
             keep_cnt += 1
 
-    print(f"[3/5] 裁剪边界(数据月份) < {cutoff_ym_lit} 视为超 1 年；"
-          f"旧记录 {len(old_rows)} 条，保留 {keep_cnt} 条"
-          + (f"（其中 {no_ym} 条无月份，已保守保留）" if no_ym else ""))
+    _log("[3/5] 裁剪边界(数据月份) < %d 视为超 1 年；旧记录 %d 条，保留 %d 条%s"
+         % (cutoff_ym_lit, len(old_rows), keep_cnt,
+            ("（其中 %d 条无月份，已保守保留）" % no_ym) if no_ym else ""))
 
     # 3a) 归档旧记录到独立库 + CSV
     if old_rows:
-        arc_db = os.path.join(HERE, f"scan_state_archive_{TS}.db")
+        arc_db = os.path.join(HERE, "scan_state_archive_%s.db" % ts)
         if os.path.exists(arc_db):
             os.remove(arc_db)
         a = sqlite3.connect(arc_db)
@@ -129,30 +144,64 @@ def main():
             "VALUES (?, ?, ?, ?)", old_rows)
         a.commit()
         a.close()
-        arc_csv = os.path.join(HERE, f"scan_state_archive_{TS}.csv")
+        arc_csv = os.path.join(HERE, "scan_state_archive_%s.csv" % ts)
         with open(arc_csv, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow(["path", "ts", "device", "ym"])
             w.writerows(old_rows)
-        print(f"       旧记录归档 -> {arc_db}")
-        print(f"       旧记录导出 -> {arc_csv}")
+        _log("       旧记录归档 -> %s" % arc_db)
+        _log("       旧记录导出 -> %s" % arc_csv)
 
-    # 4) 主库删除旧记录（指标随 metrics 宽表一并删除）
+    # 4) 主库删除旧记录（指标随 metrics 一并删除）
     if old_rows:
         old_paths = [r[0] for r in old_rows]
         ph = ",".join("?" * len(old_paths))
-        cur.execute(f"DELETE FROM metrics WHERE path IN ({ph})", old_paths)
-        cur.execute(f"DELETE FROM processed WHERE path IN ({ph})", old_paths)
+        cur.execute("DELETE FROM metrics WHERE path IN (%s)" % ph, old_paths)
+        cur.execute("DELETE FROM processed WHERE path IN (%s)" % ph, old_paths)
         conn.commit()
-        print(f"[4/5] 主库已删除 {len(old_paths)} 条旧记录（仅保留最近 {KEEP_MONTHS} 个月）")
+        _log("[4/5] 主库已删除 %d 条旧记录（仅保留最近 %d 个月）"
+             % (len(old_paths), km))
     else:
-        print("[4/5] 无超 1 年的记录，主库保持不变")
+        _log("[4/5] 无超 1 年的记录，主库保持不变")
 
-    # 5) metrics 宽表已由 analysis.ensure_tables 在建表/迁移阶段确保存在
     conn.commit()
     conn.close()
-    print("[5/5] 已确保 metrics 宽表存在，主库开启 WAL")
-    print("完成。主库现为“最近 1 年”的最新数据库；旧数据已归档备份。")
+    _log("[5/5] 已确保 metrics 宽表存在，主库开启 WAL")
+    _log("完成。主库现为“最近 %d 个月”的最新数据库；旧数据已归档备份。" % km)
+    return "归档完成"
+
+
+def preview_old(keep_months=None):
+    """预览（不修改库）：返回 (old_count, keep_count, cutoff_ym_lit, no_ym)。"""
+    km = keep_months if keep_months else KEEP_MONTHS
+    if not os.path.isfile(DB):
+        return (0, 0, None, 0)
+    try:
+        c = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    except sqlite3.Error:
+        c = sqlite3.connect(DB)
+    try:
+        cutoff_months = cur_ym_int() - km
+        cy, cm = divmod(cutoff_months, 12)
+        cutoff_ym_lit = cy * 100 + (cm + 1)
+        rows = c.execute("SELECT ym FROM processed").fetchall()
+    finally:
+        c.close()
+    old_cnt = keep_cnt = no_ym = 0
+    for (ym_s,) in rows:
+        if ym_s is None or not str(ym_s).isdigit():
+            no_ym += 1
+            keep_cnt += 1
+            continue
+        if ym_lit_to_months(int(ym_s)) < cutoff_months:
+            old_cnt += 1
+        else:
+            keep_cnt += 1
+    return (old_cnt, keep_cnt, cutoff_ym_lit, no_ym)
+
+
+def main():
+    run_maintain(log_cb=None)
 
 
 if __name__ == "__main__":
