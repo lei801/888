@@ -12,7 +12,8 @@ export_csv.py —— 按「数据月份(ym)」导出 CSV（只读连接、并发
   - 原子写：先写 .tmp 再 os.replace 改名，读取方永远读到完整文件。
   - 列定义与查看器(db_view.py)一致：默认全列；若 csv_export_cols.json 存在则按其中选中列导出。
   - 中文表头、UTF-8-SIG（Excel / 各类工具直接打开不乱码）。
-  - 库里已无数据的月份，会自动删除对应 CSV，避免残留。
+  - 历史 CSV 只增不删：库里某月即便已无数据（被裁剪/清空），也不会删除磁盘上已有的
+    对应 CSV，便于长期留档。需要清理导出目录请手动处理。
 
 用法：
   python export_csv.py --outdir "D:\\CSV\\scan_data"              # 每小时定时：只更新变动的月
@@ -217,13 +218,13 @@ def _changed_months(conn, last_run, last_export_max_id):
     裁决原则：某月 CSV 是否重写，唯一看该月 MAX(id) 是否比上次导出时记录的快照更大（即库里有新增行）。
     - 不再「当前月恒导出」：当前月没新增同样跳过；
     - 上月有新增才导出，无新增跳过；
-    - 范围限定为最近两个月（cur + prev），更早的历史月份不自动导出（用 --ym / --all 显式导一次）。
+    - 范围**严格限定为最近两个月（cur + prev）**，绝不导出更早的历史月份：
+      * 首次运行（last_run 为 None）也只在最近两个月内按「有新增才导」处理，不再全量兜底历史月；
+      * 需要导出历史月请显式用 --ym / --all 触发。
     每次判定都是纯 DB 比较，不依赖时间窗口/扫描器状态；只要库里该月有新增就导出，没新增绝不导出。
     """
     now = time.localtime()
     cur = "%04d%02d" % (now.tm_year, now.tm_mon)
-    if last_run is None:
-        return _existing_months(conn)   # 首次运行：全量兜底一次
     prev = prev_ym(cur)
     target = set()
     for ym in (cur, prev):
@@ -281,18 +282,6 @@ def _atomic_write(path, rows, columns):
     os.replace(tmp, path)
 
 
-def _cleanup_obsolete(conn, outdir):
-    """删除导出目录里、库中已不存在月份的 CSV（仅增量模式调用）。"""
-    db_months = _existing_months(conn)
-    for fn in os.listdir(outdir):
-        m = re.match(r"^FRST LOG-(\d{6})\.csv$", fn)
-        if m and m.group(1) not in db_months:
-            try:
-                os.remove(os.path.join(outdir, fn))
-            except OSError:
-                pass
-
-
 def main():
     ap = argparse.ArgumentParser(
         description="按数据月份导出 CSV（只读、增量、原子写）")
@@ -315,6 +304,7 @@ def main():
     else:
         columns = list(ALL_COLUMNS)
     filters = {"device": args.device, "path": args.path}
+    last_export_max_id = {}   # 供增量快照保留使用；--ym/--all 模式未定义时回退空 dict
 
     conn = _conn()
     try:
@@ -333,19 +323,20 @@ def main():
         for ym in sorted(target):
             path = os.path.join(outdir, f"FRST LOG-{ym}.csv")
             if not _month_has_rows(conn, ym):
-                # 库里该月已无数据：删除旧文件（若有），不写空文件
-                if os.path.exists(path):
-                    os.remove(path)
+                # 库里该月已无数据：跳过本次重写，但【不删除】磁盘上已有的旧 CSV，
+                # 以便长期留档（历史 CSV 只增不删）。
                 continue
             rows = _query_month(conn, ym, columns, filters)
             _atomic_write(path, rows, columns)
             done.append(ym)
 
-        if incremental:
-            _cleanup_obsolete(conn, outdir)
+        # 已移除自动清理(_cleanup_obsolete)：历史 CSV 不再因库里某月被裁空而被删除，
+        # 满足长期留档需求。需要清理时请手动处理导出目录。
         # 更新增量状态：last_run 时间 + 本次重写的各月 MAX(id) 快照（用于下次判「该月是否新增」）
         # 必须在 conn.close() 之前执行，否则会操作已关闭的数据库连接
-        snap = {}
+        # 保留已有快照：本次 0 个月（无新增）时不重置为 { }，
+        # 否则下次会把最近月份误判为「有新增」而全部重导。
+        snap = dict(last_export_max_id)
         for ym in done:
             snap[ym] = _month_max_id(conn, ym)
         _save_state(_now_str(), snap)

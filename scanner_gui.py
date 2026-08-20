@@ -50,6 +50,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 import analysis  # 指标逻辑唯一来源：compute_all / upsert / ensure_tables / recalc_by_months
 import export_csv  # 自动导出：复用的列定义(ALL_COLUMNS)与按月导出逻辑
+import ui_common  # 共享筛选组件 LineDeviceMonthFilter / 状态色常量
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 RECALC_LOG = os.path.join(_HERE, "scan_state_recalc_log.txt")
@@ -59,6 +60,70 @@ INI_FILE = os.path.join(_HERE, "scan_state.ini")         # 配置（ini，存扫
 # ====================== 配置区 ======================
 POLL_INTERVAL = 20   # 默认轮询间隔（秒），可在 UI「轮询间隔」中输入覆盖，持久化到 state
 MAX_LOG_LINES = 500   # 列表区最多保留的已处理文件条目
+_FLUSH_BATCH = 20000  # 内存优化：新增候选累积满该数量即落库 + 算指标 + 清空，避免整轮堆叠 pending_rows
+# ====================================================
+
+# ====================== 居中消息框 ======================
+# tkinter 原生 messagebox 在 Windows 上始终居中于屏幕，无法随所属界面定位。
+# 这里把 messagebox 的方法替换为居中版：弹出时精确对齐到父窗口几何中心。
+# 现有 messagebox.showinfo/showwarning/showerror/askyesno(...) 调用全部自动生效，
+# 无需逐处修改（parent 关键字照常支持）。
+import tkinter.messagebox as _mb
+import tkinter as _tk
+from tkinter import ttk as _ttk
+
+
+def _mb_root(parent):  # type: ignore[no-untyped-def]
+    """弹窗父窗口：优先用传入的 parent，否则用 tkinter 默认根窗口。"""
+    if parent is not None:
+        return parent
+    r = getattr(_tk, "_get_default_root", lambda: None)()
+    assert r is not None
+    return r
+
+
+def _mb_center(dlg, parent):  # type: ignore[no-untyped-def]
+    parent = _mb_root(parent)
+    dlg.update_idletasks()
+    dlg.geometry("+%d+%d" % (
+        parent.winfo_rootx() + max(0, (parent.winfo_width() - dlg.winfo_width()) // 2),
+        parent.winfo_rooty() + max(0, (parent.winfo_height() - dlg.winfo_height()) // 2)))
+
+
+def _mb_box(parent, title, msg, buttons=("确定",)):  # type: ignore[no-untyped-def]
+    parent = _mb_root(parent)
+    dlg = _tk.Toplevel(parent)
+    dlg.withdraw()
+    dlg.title(title or "提示")
+    dlg.resizable(False, False)
+    res = {}
+    body = _ttk.Frame(dlg, padding=(20, 16, 20, 8))
+    body.pack(fill="both", expand=True)
+    _tk.Label(body, text=msg, justify="left", anchor="w",
+              wraplength=max(240, parent.winfo_width() - 100)).pack(fill="x")
+    bar = _ttk.Frame(dlg, padding=(0, 0, 0, 12))
+    bar.pack(fill="x")
+    def _fin(v):
+        res["v"] = v
+        dlg.destroy()
+    for b in reversed(buttons):
+        _ttk.Button(bar, text=b, width=9, command=lambda b=b: _fin(b)) \
+            .pack(side="right", padx=4)
+    dlg.protocol("WM_DELETE_WINDOW", lambda: _fin(None))
+    dlg.bind("<Return>", lambda e: _fin(buttons[-1]))
+    dlg.grab_set()
+    _mb_center(dlg, parent)
+    dlg.deiconify()
+    dlg.lift()
+    parent.wait_window(dlg)
+    return res.get("v")
+
+
+_mb.showinfo = lambda title, msg, **kw: _mb_box(kw.get("parent"), title, msg)
+_mb.showwarning = lambda title, msg, **kw: _mb_box(kw.get("parent"), title, msg)
+_mb.showerror = lambda title, msg, **kw: _mb_box(kw.get("parent"), title, msg)
+_mb.askyesno = lambda title, msg, **kw: \
+    _mb_box(kw.get("parent"), title, msg, buttons=("是", "否")) == "是"
 # ====================================================
 
 
@@ -74,6 +139,9 @@ _DEFAULT_CONFIG = {
     "compute_after_scan": True,
     # 计算指标并行线程数：历史回填/重新计算/补算缺失共用；1=不并行，网络盘可适当调大
     "compute_workers": 4,
+    # 并行方式：thread=串行（监控小批量够用、不养子进程、内存最省）；process=多进程（绕开 GIL，
+    # CPU 密集回填/重算真并行提速，算完自动释放子进程内存）。已移除多线程。
+    "compute_mode": "process",
     "device_list": [],   # 设备清单：首次运行由扫描路径嗅探并持久化；之后直接拼路径省去每轮 listdir
     # 监控阶段 mtime 优先缓存：目录路径 -> 上轮记录到的 mtime（浮点秒）。
     # 仅监控阶段使用；回填（历史全量）始终全量 scandir，不经此缓存。
@@ -373,7 +441,7 @@ class ScannerApp:
         scale = _dpi_scale()
         _sw = self.root.winfo_screenwidth()
         _sh = self.root.winfo_screenheight()
-        _w = min(int(800 * scale), int(_sw * 0.92))
+        _w = min(int(700 * scale), int(_sw * 0.92))
         _h = min(int(600 * scale), int(_sh * 0.9))
         self.root.geometry(f"{_w}x{_h}")
         self.root.minsize(int(_w * 0.8), int(_h * 0.72))  # 防止缩太小导致控件错乱/裁剪
@@ -392,25 +460,21 @@ class ScannerApp:
         self.stop_event = threading.Event()
         self.q = Queue()
 
-        # 自动导出（按月 CSV）：变量与运行态
+        # 自动导出（按月 CSV）运行态：配置 UI 在任务中心「CSV 导出」页；线程挂在主程序，
+        # 生命周期长于任务中心对话框——关闭对话框不影响已启动的定时导出。
         self.auto_stop = None          # threading.Event；None / 已 set = 未运行
         self.auto_thread = None
-        self._toggling = False        # 防止勾选框 trace 递归
-        self.auto_enabled_var = tk.BooleanVar(value=bool(self.state.get("csv_auto_enabled", False)))
-        self.auto_interval_var = tk.StringVar(value=str(self.state.get("csv_auto_interval_min", 60)))
-        self.auto_path_var = tk.StringVar(value=self.state.get("csv_auto_outdir", ""))
-        self.auto_cols_vars = {}
-        _auto_cols = self.state.get("csv_auto_cols") or []
-        for _label in self._auto_column_labels():
-            self.auto_cols_vars[_label] = tk.BooleanVar(
-                value=(_label in _auto_cols) if _auto_cols else True)  # 首次默认全选
+        # 导出列统一为一份 csv_cols（兼容迁移：优先旧 csv_auto_cols，回退 csv_manual_cols）
+        if "csv_cols" not in self.state:
+            self.state["csv_cols"] = (self.state.get("csv_auto_cols")
+                                      or self.state.get("csv_manual_cols") or [])
 
         self._apply_style()
         self._build_ui()
         self._refresh_from_state()
-        # 若配置启用了自动导出，则自动开始（缺目录则静默跳过并取消勾选）
+        # 若配置启用了自动导出，则启动时自动恢复定时导出（失败仅记日志，不弹窗）
         if self.state.get("csv_auto_enabled"):
-            self._on_auto_enabled_toggle()
+            self.start_auto_export(silent=True)
         # 启动 UI 轮询
         self.root.after(50, self._poll)
 
@@ -467,7 +531,7 @@ class ScannerApp:
         self.lbl_title_status.pack(side="left")
 
         # --- 扫描设置（可折叠：点整行展开/收起，默认展开）---
-        self.frm_scan_box, _, frm_settings = self._make_collapsible(
+        self.frm_scan_box, frm_scan_head_right, frm_settings = self._make_collapsible(
             root, "扫描设置", 1, expanded=True, pady=(8, 4))
         self.frm_scan_inner = frm_settings
 
@@ -477,6 +541,9 @@ class ScannerApp:
         frm_path.columnconfigure(1, weight=1)   # 扫描路径输入框可拉伸
         ttk.Label(frm_path, text="扫描路径：").grid(row=0, column=0, sticky="w")
         self.path_var = tk.StringVar(value=self.state.get("scan_root", ""))
+        # 起始年月（历史回填起点，显示在主界面「历史回填」按钮右侧供设定）
+        self.start_year_var = tk.StringVar(value=str(self.state.get("start_year", 2025)))
+        self.start_month_var = tk.StringVar(value="%02d" % self.state.get("start_month", 1))
         self.entry_path = ttk.Entry(frm_path, textvariable=self.path_var)
         self.entry_path.grid(row=0, column=1, sticky="ew", padx=(4, 4))
         self.btn_browse = ttk.Button(frm_path, text="浏览...", command=self._browse)
@@ -484,41 +551,15 @@ class ScannerApp:
         self.btn_open_path = ttk.Button(frm_path, text="打开路径", command=self._open_scan_path)
         self.btn_open_path.grid(row=0, column=3, sticky="w", padx=(0, 10))
 
-        # 首次搜索起始月份（含）
-        frm_ym = ttk.Frame(frm_settings, padding=(2, 2, 2, 6))
-        frm_ym.pack(fill="x")
-        ttk.Label(frm_ym, text="起始月份：").grid(row=0, column=0, sticky="w")
-        self.start_year_var = tk.StringVar(value=str(self.state.get("start_year", 2025)))
-        self.start_month_var = tk.StringVar(value="%02d" % self.state.get("start_month", 1))
-        self.spin_year = ttk.Spinbox(frm_ym, from_=2000, to=2100, width=6,
-                                     textvariable=self.start_year_var, wrap=True)
-        self.spin_year.grid(row=0, column=1, sticky="w", padx=(4, 2))
-        ttk.Label(frm_ym, text="年").grid(row=0, column=2, sticky="w")
-        self.spin_month = ttk.Spinbox(frm_ym, from_=1, to=12, width=4,
-                                      textvariable=self.start_month_var, wrap=True,
-                                      format="%02.0f")
-        self.spin_month.grid(row=0, column=3, sticky="w", padx=(2, 2))
-        ttk.Label(frm_ym, text="月").grid(row=0, column=4, sticky="w")
-        # 历史回填按钮与起始月份同一行
-        self.btn_backfill = ttk.Button(frm_ym, text="历史回填", command=self.history_backfill)
-        self.btn_backfill.grid(row=0, column=5, sticky="w", padx=(16, 0))
+        # 起始月份已移至「任务中心」的扫描页设定，主界面不再显示。
 
-        # 第一行：轮询间隔 + 跨月兜底窗口（均运行中即时生效）
-        frm_poll1 = ttk.Frame(frm_settings, padding=(2, 2, 2, 2))
-        frm_poll1.pack(fill="x")
-        ttk.Label(frm_poll1, text="轮询间隔：").pack(side="left")
+        # 间隔（置于「扫描设置」折叠标题栏同一排右侧、靠右对齐，运行中即时生效）
+        ttk.Label(frm_scan_head_right, text="秒").pack(side="right", padx=(0, 6))
         self.poll_var = tk.StringVar(value=str(self.state.get("poll_interval", 20)))
-        self.entry_poll = ttk.Entry(frm_poll1, textvariable=self.poll_var, width=8)
-        self.entry_poll.pack(side="left", padx=(4, 2))
-        ttk.Label(frm_poll1, text="秒").pack(side="left")
-        ttk.Label(frm_poll1, text="跨月兜底：").pack(side="left", padx=(14, 0))
-        self.prev_hours_var = tk.StringVar(value=str(self.state.get("prev_scan_hours", 6)))
-        self.entry_prev_hours = ttk.Entry(frm_poll1, textvariable=self.prev_hours_var, width=5)
-        self.entry_prev_hours.pack(side="left", padx=(4, 2))
-        ttk.Label(frm_poll1, text="小时").pack(side="left")
-        # 运行中即时生效：合法值立即写入 state（后台每轮读取），与产线/算指标行为一致
+        self.entry_poll = ttk.Entry(frm_scan_head_right, textvariable=self.poll_var, width=8)
+        self.entry_poll.pack(side="right", padx=(2, 0))
+        ttk.Label(frm_scan_head_right, text="间隔：").pack(side="right", padx=(8, 2))
         self.poll_var.trace_add("write", self._on_poll_change)
-        self.prev_hours_var.trace_add("write", self._on_prev_hours_change)
 
         # 第二行：产线 + 计算 + 设备清单
         frm_poll2 = ttk.Frame(frm_settings, padding=(2, 2, 2, 6))
@@ -541,131 +582,62 @@ class ScannerApp:
         self.chk_compute.pack(side="left", padx=(14, 2))
         self.btn_devlist = ttk.Button(frm_poll2, text="设备清单…", command=self.open_device_list_dialog)
         self.btn_devlist.pack(side="left", padx=(14, 2))
+        self.btn_backfill = ttk.Button(frm_poll2, text="历史回填", command=self._start_backfill_from_main)
+        self.btn_backfill.pack(side="left", padx=(6, 2))
+        # 历史回填起始年月（紧随历史回填按钮，供回填设定起始月）
+        ttk.Label(frm_poll2, text="起始:").pack(side="left", padx=(12, 2))
+        ttk.Spinbox(frm_poll2, from_=2000, to=2100, width=6,
+                    textvariable=self.start_year_var, wrap=True).pack(side="left", padx=(0, 2))
+        ttk.Label(frm_poll2, text="年").pack(side="left")
+        ttk.Spinbox(frm_poll2, from_=1, to=12, width=4,
+                    textvariable=self.start_month_var, wrap=True, format="%02.0f").pack(side="left", padx=(2, 2))
+        ttk.Label(frm_poll2, text="月").pack(side="left")
 
-        # 第三行：线程数量设定（历史回填/重新计算/补算缺失的计算并行度，运行中即时生效）
+        # 第三行：跨月兜底 + 线程数量（运行中即时生效）
         frm_workers = ttk.Frame(frm_settings, padding=(2, 2, 2, 2))
         frm_workers.pack(fill="x")
-        ttk.Label(frm_workers, text="线程数量：").pack(side="left")
+        # 跨越兜底（线程数量同一行前面，运行中即时生效）
+        ttk.Label(frm_workers, text="跨月兜底：").pack(side="left", padx=(0, 2))
+        self.prev_hours_var = tk.StringVar(value=str(self.state.get("prev_scan_hours", 6)))
+        self.entry_prev_hours = ttk.Entry(frm_workers, textvariable=self.prev_hours_var, width=5)
+        self.entry_prev_hours.pack(side="left", padx=(4, 2))
+        ttk.Label(frm_workers, text="小时").pack(side="left", padx=(0, 10))
+        self.prev_hours_var.trace_add("write", self._on_prev_hours_change)
+        ttk.Label(frm_workers, text="并行数：").pack(side="left")
         self.workers_var = tk.StringVar(value=str(self.state.get("compute_workers", 4)))
-        self.spin_workers = ttk.Spinbox(frm_workers, from_=1, to=32, width=5,
+        self.spin_workers = ttk.Spinbox(frm_workers, from_=1, to=32, width=4,
                                         textvariable=self.workers_var)
         self.spin_workers.pack(side="left", padx=(4, 2))
         self.workers_var.trace_add("write", self._on_workers_change)
+        ttk.Label(frm_workers, text="方式：").pack(side="left", padx=(10, 2))
+        # 显示用中文，内部映射到 thread(串行)/process(多进程)
+        _mode_zh = "多进程" if self.state.get("compute_mode", "process") == "process" else "串行"
+        self.compute_mode_var = tk.StringVar(value=_mode_zh)
+        self.combo_mode = ttk.Combobox(frm_workers, state="readonly", width=7,
+                                       values=("串行", "多进程"),
+                                       textvariable=self.compute_mode_var)
+        self.combo_mode.pack(side="left")
+        self.compute_mode_var.trace_add("write", self._on_compute_mode_change)
 
-        # --- 月度导出设置（可折叠：点整行展开/收起，默认收起）---
-        self.frm_auto_box, auto_head_right, frm_auto = self._make_collapsible(
-            root, "月度导出设置", 2, expanded=False, pady=(4, 4))
-        # 启用复选框（直接可见，勾选即开始 / 取消即停止）
-        self.chk_auto = ttk.Checkbutton(
-            auto_head_right, text="启用自动导出", variable=self.auto_enabled_var)
-        self.chk_auto.pack(side="left", padx=(12, 0))
-        self.auto_enabled_var.trace_add("write", lambda *a: self._on_auto_enabled_toggle())
-        ttk.Label(auto_head_right, text="间隔：").pack(side="left", padx=(12, 2))
-        self.entry_auto_interval = ttk.Entry(
-            auto_head_right, textvariable=self.auto_interval_var, width=8)
-        self.entry_auto_interval.pack(side="left", padx=(0, 2))
-        self.auto_interval_var.trace_add(
-            "write", lambda *a: self._save_auto_config(silent=True))
-        ttk.Label(auto_head_right, text="分钟").pack(side="left")
-        self.frm_auto = frm_auto
-
-        auto_row1 = ttk.Frame(frm_auto, padding=(2, 2, 2, 4))
-        auto_row1.pack(fill="x")
-        auto_row1.columnconfigure(1, weight=1)
-        ttk.Label(auto_row1, text="导出目录：").grid(row=0, column=0, sticky="w")
-        self.entry_auto_path = ttk.Entry(auto_row1, textvariable=self.auto_path_var)
-        self.entry_auto_path.grid(row=0, column=1, sticky="ew", padx=(4, 4))
-        ttk.Button(auto_row1, text="浏览...", command=self._browse_auto_path).grid(row=0, column=2, sticky="e")
-        ttk.Button(auto_row1, text="立即导出一次",
-                    command=lambda: self._auto_export_once(log=True)).grid(row=0, column=3, sticky="w", padx=(6, 0))
-        ttk.Button(auto_row1, text="打开目录",
-                   command=self._open_auto_path).grid(row=0, column=4, sticky="w", padx=(6, 0))
-
-        auto_row2 = ttk.Frame(frm_auto, padding=(2, 2, 2, 4))
-        auto_row2.pack(fill="x")
-        ttk.Label(auto_row2, text="导出列：").pack(side="left", anchor="n", padx=(0, 4))
-        auto_right = ttk.Frame(auto_row2)
-        auto_right.pack(side="left", fill="x", expand=True)
-        # 全选 / 清空工具行
-        cols_tool = ttk.Frame(auto_right)
-        cols_tool.pack(fill="x", pady=(0, 3))
-        ttk.Button(cols_tool, text="全选", width=6,
-                   command=lambda: self._set_all_auto_cols(True)).pack(side="left", padx=(0, 6))
-        ttk.Button(cols_tool, text="清空", width=6,
-                   command=lambda: self._set_all_auto_cols(False)).pack(side="left")
-        # 可滚动的勾选区：高度按列数动态加高，封顶 300px，再高走滚动条；
-        # 既紧凑（列少不空白）又不撑高整个面板。
-        _auto_labels = self._auto_column_labels()
-        _ncol = 3
-        _auto_rows = max(1, (len(_auto_labels) + _ncol - 1) // _ncol)
-        _AUTO_BOX_H = min(max(90, _auto_rows * 22 + 8), 300)
-        auto_cols_box = ttk.Frame(auto_right, borderwidth=1, relief="solid")
-        auto_cols_box.pack(fill="x", expand=False)
-        auto_canv = tk.Canvas(auto_cols_box, highlightthickness=0, height=_AUTO_BOX_H)
-        auto_sb = ttk.Scrollbar(auto_cols_box, orient="vertical",
-                                command=auto_canv.yview)
-        auto_inner = ttk.Frame(auto_canv)
-        auto_inner.bind("<Configure>",
-                         lambda e: auto_canv.configure(
-                             scrollregion=auto_canv.bbox("all")))
-        _auto_win = auto_canv.create_window((0, 0), window=auto_inner, anchor="nw")
-        auto_canv.bind("<Configure>",
-                       lambda e: auto_canv.itemconfigure(_auto_win, width=e.width))
-        auto_canv.configure(yscrollcommand=auto_sb.set)
-        auto_canv.pack(side="left", fill="both", expand=True)
-        auto_sb.pack(side="right", fill="y")
-        # 鼠标滚轮（中键/触控板）滚动：Canvas 自定义容器无原生滚轮，需手动绑定
-        auto_canv.bind("<MouseWheel>",
-                       lambda e: auto_canv.yview_scroll(int(-e.delta / 120), "units"))
-        auto_canv.bind("<Button-4>",
-                       lambda e: auto_canv.yview_scroll(-1, "units"))
-        auto_canv.bind("<Button-5>",
-                       lambda e: auto_canv.yview_scroll(1, "units"))
-        # 自适应列数：按 Canvas 可用宽度估算每行列数，窗口/面板拉伸时自动重排
-        _AUTO_COL_W = 150  # 每列估算像素宽度
-        _auto_widgets = []
-        for _label in _auto_labels:
-            # 勾选即持久化（写入 scan_state.ini 的 csv_auto_cols），无需先点启动
-            self.auto_cols_vars[_label].trace_add(
-                "write", lambda *a, lbl=_label: self._write_auto_cols())
-            _auto_widgets.append(
-                ttk.Checkbutton(auto_inner, text=_label,
-                                variable=self.auto_cols_vars[_label]))
-
-        def _relayout_auto_cols():
-            _w = auto_canv.winfo_width()
-            # 每列预留 padx 余量，避免最右列被 Canvas 边缘裁切、名称显示不全
-            _n = max(1, _w // (_AUTO_COL_W + 14))
-            for _i, _wd in enumerate(_auto_widgets):
-                _wd.grid(row=_i // _n, column=_i % _n, sticky="w", padx=(0, 14))
-            auto_canv.configure(scrollregion=auto_canv.bbox("all"))
-        auto_canv.bind("<Configure>", lambda e: _relayout_auto_cols())
-
-        # --- 控制按钮 ---
+        # --- 控制按钮：开始/暂停/停止负责普通轮询扫描；历史回填在扫描设置区单独按钮 ---
         frm_btn = ttk.Frame(root, padding=(8, 4))
         frm_btn.grid(row=3, column=0, sticky="ew")
         self.btn_start = ttk.Button(frm_btn, text="开始", command=self.start_scan,
-                                     style="Start.TButton")
+                                    style="Start.TButton")
         self.btn_pause = ttk.Button(frm_btn, text="暂停", command=self.pause_scan,
                                     style="Pause.TButton", state="disabled")
         self.btn_stop = ttk.Button(frm_btn, text="停止", command=self.stop_scan,
                                    style="Stop.TButton", state="disabled")
         self.btn_reset = ttk.Button(frm_btn, text="重置状态", command=self.reset_state)
         self.btn_view = ttk.Button(frm_btn, text="查看数据库", command=self.open_db_view)
-        self.btn_recalc = ttk.Button(frm_btn, text="重新计算指标", command=self.open_recalc_dialog)
-        self.btn_compute_new = ttk.Button(frm_btn, text="补算缺失指标",
-                                          command=self.open_compute_new_dialog)
-        self.btn_manual_export = ttk.Button(frm_btn, text="手动导出",
-                                            command=self.open_manual_export_dialog)
+        self.btn_tasks = ttk.Button(frm_btn, text="任务中心", command=self.open_task_center)
         self.btn_start.grid(row=0, column=0, padx=(0, 6))
         self.btn_pause.grid(row=0, column=1, padx=(0, 6))
         self.btn_stop.grid(row=0, column=2, padx=(0, 6))
         self.btn_reset.grid(row=0, column=3, padx=(0, 6))
         self.btn_view.grid(row=0, column=4, padx=(0, 6))
-        self.btn_recalc.grid(row=0, column=5, padx=(0, 6))
-        self.btn_compute_new.grid(row=0, column=6, padx=(0, 6))
-        self.btn_manual_export.grid(row=0, column=7, padx=(0, 6))
-        frm_btn.columnconfigure(8, weight=1)  # 说明列吸收右侧多余空白，按钮区左对齐更整齐
+        self.btn_tasks.grid(row=0, column=5, padx=(0, 6))
+        frm_btn.columnconfigure(6, weight=1)  # 说明列吸收右侧多余空白，按钮区左对齐更整齐
 
         # --- 主区域：上方=当前扫描行，下方=可拖动分隔的左右面板 ---
         frm_main = ttk.Frame(root, padding=(8, 4, 8, 4))
@@ -714,7 +686,7 @@ class ScannerApp:
             frm_stat.columnconfigure(i, weight=1 if i in (1, 3, 5) else 0)
         ttk.Label(frm_stat, text="状态：").grid(row=0, column=0, sticky="w")
         self.status_var = tk.StringVar(value="空闲")
-        self.lbl_status = ttk.Label(frm_stat, textvariable=self.status_var, foreground="#0a0")
+        self.lbl_status = ttk.Label(frm_stat, textvariable=self.status_var, foreground=ui_common.COLOR_OK)
         self.lbl_status.grid(row=0, column=1, sticky="w")
 
         ttk.Label(frm_stat, text="本轮候选：").grid(row=0, column=2, sticky="w")
@@ -812,6 +784,14 @@ class ScannerApp:
         if n < 1 or n > 32:
             return
         self.state["compute_workers"] = n
+
+    def _on_compute_mode_change(self, *a):
+        # 并行方式即时写入 state：UI 显示中文，映射为 thread=串行 / process=多进程（绕开 GIL 提速）
+        zh = self.compute_mode_var.get()
+        mode = "process" if zh == "多进程" else "thread"
+        if self.state.get("compute_mode") != mode:
+            self.state["compute_mode"] = mode
+            self._save_config()
         self._save_config()
 
     def _get_compute_workers(self):
@@ -822,16 +802,36 @@ class ScannerApp:
             return 4
 
     def _set_path_settings_enabled(self, enabled):
-        """运行中锁定「开始才生效」的控件（路径/浏览/起始年月）。
-        产线、算指标、轮询、设备清单、导出区均即时生效，保持可用。"""
+        """运行中锁定「开始才生效」的控件（路径/浏览）。
+        产线、算指标、设备清单、导出区均即时生效，保持可用。"""
         state = "normal" if enabled else "disabled"
-        for w in (self.entry_path, self.btn_browse, self.btn_open_path,
-                  self.spin_year, self.spin_month):
+        for w in (self.entry_path, self.btn_browse, self.btn_open_path):
             w.config(state=state)
+        self._refresh_poll_state(enabled)  # 扫描开始/结束同时刷新「间隔」可用性
+
+    def _refresh_poll_state(self, enabled=True):
+        """扫描设置「间隔（秒）」输入：扫描进行中锁定，否则可改。"""
+        self.entry_poll.config(state="normal" if enabled else "disabled")
+
+    def _dlg_parent(self):
+        """返回当前激活的顶层窗口作为弹窗父窗口：
+        任务中心等 Toplevel 被聚焦时锚定它，否则回退主界面 root，
+        使弹窗居中于正在操作的界面（而非屏幕/主界面）。"""
+        try:
+            f = self.root.focus_get()
+            while f is not None and not isinstance(f, (tk.Tk, tk.Toplevel)):
+                f = f.master
+            if f is not None and f.winfo_viewable():
+                return f
+        except Exception:
+            pass
+        return self.root
+
 
     # ---------- 控件回调 ----------
     def _browse(self):
-        d = filedialog.askdirectory(initialdir=self.path_var.get() or os.path.expanduser("~"))
+        d = filedialog.askdirectory(parent=self._dlg_parent(),
+                                    initialdir=self.path_var.get() or os.path.expanduser("~"))
         if d:
             self.path_var.set(d)
             self.state["scan_root"] = d
@@ -841,32 +841,32 @@ class ScannerApp:
         """在系统文件管理器中打开当前扫描路径（不存在则提示）。"""
         p = self.path_var.get().strip()
         if not p:
-            messagebox.showinfo("打开路径", "请先设置扫描路径。")
+            messagebox.showinfo("打开路径", "请先设置扫描路径。", parent=self._dlg_parent())
             return
         if os.path.isfile(p):
             p = os.path.dirname(p)
         if not os.path.isdir(p):
-            messagebox.showerror("打开路径", "路径不存在：\n%s" % p)
+            messagebox.showerror("打开路径", "路径不存在：\n%s" % p, parent=self._dlg_parent())
             return
         try:
             os.startfile(p)
         except Exception as e:
-            messagebox.showerror("打开路径", "无法打开目录：%s" % e)
+            messagebox.showerror("打开路径", "无法打开目录：%s" % e, parent=self._dlg_parent())
 
     def start_scan(self):
         path = self.path_var.get().strip()
         if not path or not os.path.isdir(path):
-            messagebox.showerror("路径无效", "请先选择有效的扫描路径。")
+            messagebox.showerror("路径无效", "请先选择有效的扫描路径。", parent=self._dlg_parent())
             return
         # 读取并校验起始月份
         try:
             sy = int(self.start_year_var.get().strip())
             sm = int(self.start_month_var.get().strip())
         except ValueError:
-            messagebox.showerror("起始月份无效", "起始年/月必须是数字。")
+            messagebox.showerror("起始月份无效", "起始年/月必须是数字。", parent=self._dlg_parent())
             return
         if not (1 <= sm <= 12):
-            messagebox.showerror("起始月份无效", "月份必须在 1–12 之间。")
+            messagebox.showerror("起始月份无效", "月份必须在 1–12 之间。", parent=self._dlg_parent())
             return
         self.state["start_year"] = sy
         self.state["start_month"] = sm
@@ -878,10 +878,10 @@ class ScannerApp:
         try:
             poll = int(self.poll_var.get().strip())
         except ValueError:
-            messagebox.showerror("轮询间隔无效", "轮询间隔必须是正整数（秒）。")
+            messagebox.showerror("轮询间隔无效", "轮询间隔必须是正整数（秒）。", parent=self._dlg_parent())
             return
         if poll <= 0:
-            messagebox.showerror("轮询间隔无效", "轮询间隔必须大于 0 秒。")
+            messagebox.showerror("轮询间隔无效", "轮询间隔必须大于 0 秒。", parent=self._dlg_parent())
             return
         self.state["poll_interval"] = poll
         self._save_config()  # 立即持久化，后台线程每轮从 state 读取最新间隔
@@ -889,10 +889,10 @@ class ScannerApp:
         try:
             prev_hours = int(self.prev_hours_var.get().strip())
         except ValueError:
-            messagebox.showerror("跨月兜底无效", "跨月兜底窗口必须是正整数（小时）。")
+            messagebox.showerror("跨月兜底无效", "跨月兜底窗口必须是正整数（小时）。", parent=self._dlg_parent())
             return
         if prev_hours <= 0:
-            messagebox.showerror("跨月兜底无效", "跨月兜底窗口必须大于 0 小时。")
+            messagebox.showerror("跨月兜底无效", "跨月兜底窗口必须大于 0 小时。", parent=self._dlg_parent())
             return
         self.state["prev_scan_hours"] = prev_hours
         self._save_config()
@@ -902,7 +902,7 @@ class ScannerApp:
         # 设备清单须手动嗅探（对话框「从扫描路径嗅探」）填充；为空则不扫（无目标目录）
         if not self.state.get("device_list"):
             self.q.put(("log", "⚠ 设备清单为空，请先在「设备清单」中手动嗅探或从扫描路径嗅探后再开始扫描。"))
-            messagebox.showwarning("设备清单为空", "设备清单为空，请先在「设备清单」中手动嗅探后再开始扫描。")
+            messagebox.showwarning("设备清单为空", "设备清单为空，请先在「设备清单」中手动嗅探后再开始扫描。", parent=self._dlg_parent())
             return
         # 月初窗口内存在未确认设备时会顺带扫上月，标题栏如实反映，避免“仅当前月”误导
         line = self.state.get("scan_lines", [])
@@ -921,8 +921,7 @@ class ScannerApp:
         self.stop_event.clear()
         self.pause_event.clear()
         self.btn_start.config(state="disabled")
-        self.btn_backfill.config(state="disabled")
-        self.btn_pause.config(state="normal")
+        self.btn_pause.config(state="normal", text="暂停")
         self.btn_stop.config(state="normal")
         self._set_path_settings_enabled(False)  # 运行中锁定「开始才生效」的控件
         self.status_var.set("扫描中")
@@ -930,26 +929,44 @@ class ScannerApp:
         self.thread = threading.Thread(target=self._run, args=(path, False), daemon=True)
         self.thread.start()
         self._set_title(self.mode_var.get(), "run")
-        self.lbl_status.config(foreground="#0a7d2c")
+        self.lbl_status.config(foreground=ui_common.COLOR_OK)
+
+    def _start_backfill_from_main(self):
+        """主界面「历史回填」按钮：使用主界面起始年月、产线与全部已保存设备，
+        一次性扫描 起始月→当前月。日志与统计结果直接输出到主界面中间区（参照轮询）。"""
+        sy = self.start_year_var.get().strip()
+        sm = self.start_month_var.get().strip()
+        if not messagebox.askyesno(
+                "确认历史回填",
+                "将从 %s 年 %s 月起，按已保存设备回填各月备份文件。\n\n是否开始历史回填？"
+                % (sy, sm), parent=self.root):
+            return
+        self.history_backfill()
 
     def history_backfill(self):
-        """历史回填：一次性扫描 起始月→当前月 全量设备备份目录（不轮询）。"""
+        """历史回填：一次性扫描 起始月→当前月 设备备份目录（不轮询）。
+        起始年月与产线取主界面设置区当前值；设备用全部已保存设备。"""
         path = self.path_var.get().strip()
         if not path or not os.path.isdir(path):
-            messagebox.showerror("路径无效", "请先选择有效的扫描路径。")
+            messagebox.showerror("路径无效", "请先选择有效的扫描路径。", parent=self._dlg_parent())
             return
         try:
             sy = int(self.start_year_var.get().strip())
+        except ValueError:
+            messagebox.showerror("起始月份无效", "起始年必须是数字。", parent=self._dlg_parent())
+            return
+        try:
             sm = int(self.start_month_var.get().strip())
         except ValueError:
-            messagebox.showerror("起始月份无效", "起始年/月必须是数字。")
+            messagebox.showerror("起始月份无效", "起始月必须是数字。", parent=self._dlg_parent())
             return
         if not (1 <= sm <= 12):
-            messagebox.showerror("起始月份无效", "月份必须在 1–12 之间。")
+            messagebox.showerror("起始月份无效", "月份必须在 1–12 之间。", parent=self._dlg_parent())
             return
+        lines = [ln for ln, v in self.line_vars.items() if v.get()]
         self.state["start_year"] = sy
         self.state["start_month"] = sm
-        self.state["scan_lines"] = [ln for ln, v in self.line_vars.items() if v.get()]
+        self.state["scan_lines"] = sorted(lines)
         self._save_config()
         line = self.state.get("scan_lines", [])
         line_txt = (" · 产线%s" % "/".join(line)) if line else ""
@@ -959,7 +976,6 @@ class ScannerApp:
         self.stop_event.clear()
         self.pause_event.clear()
         self.btn_start.config(state="disabled")
-        self.btn_backfill.config(state="disabled")
         self.btn_pause.config(state="disabled")  # 一次性任务，不支持暂停
         self.btn_stop.config(state="normal")
         self._set_path_settings_enabled(False)  # 回填中锁定「开始才生效」的控件
@@ -977,7 +993,7 @@ class ScannerApp:
             self.btn_pause.config(text="暂停")
             self.status_var.set("扫描中")
             self._set_title(self.mode_var.get(), "run")
-            self.lbl_status.config(foreground="#0a7d2c")
+            self.lbl_status.config(foreground=ui_common.COLOR_OK)
         else:
             self.pause_event.set()
             self.btn_pause.config(text="继续")
@@ -992,12 +1008,12 @@ class ScannerApp:
         self.pause_event.clear()  # 解除暂停以便线程能检查 stop
         self.status_var.set("正在停止...")
         self._set_title("正在停止...", "stop")
-        self.lbl_status.config(foreground="#c00000")
+        self.lbl_status.config(foreground=ui_common.COLOR_ERR)
 
     def reset_state(self):
         """清空已处理记录（保留扫描路径）。下次「开始」将全量重新扫描。"""
         if self.thread and self.thread.is_alive():
-            messagebox.showwarning("请先停止", "扫描进行中，请先「停止」再重置状态。")
+            messagebox.showwarning("请先停止", "扫描进行中，请先「停止」再重置状态。", parent=self._dlg_parent())
             return
         n = self.conn.execute("SELECT COUNT(*) FROM processed").fetchone()[0]
         self.processed_set = set()
@@ -1011,7 +1027,7 @@ class ScannerApp:
         self.done_var.set("0")
         self.progress["value"] = 0
         self.status_var.set("状态已重置")
-        self.lbl_status.config(foreground="#0a7d2c")
+        self.lbl_status.config(foreground=ui_common.COLOR_OK)
         sy = self.state.get("start_year", 2025)
         sm = self.state.get("start_month", 1)
         self.mode_var.set("监控中：每轮仅当前月")
@@ -1025,18 +1041,22 @@ class ScannerApp:
         try:
             from db_view import open_db_view as _open
         except Exception as e:
-            messagebox.showerror("无法打开查看器", "导入 db_view 失败：%s" % e)
+            messagebox.showerror("无法打开查看器", "导入 db_view 失败：%s" % e, parent=self._dlg_parent())
             return
         try:
             _open(self.root)
         except Exception as e:
-            messagebox.showerror("无法打开查看器", str(e))
+            messagebox.showerror("无法打开查看器", str(e), parent=self._dlg_parent())
+
+    def _use_process(self):
+        """是否启用多进程计算（state['compute_mode']=='process'）。默认 thread=串行。"""
+        return self.state.get("compute_mode", "process") == "process"
 
     def _compute_metrics_batch(self, paths, stop_event=None):
         """本轮扫描结束后，对本轮新增的文件统一批量计算指标并落库（在线实时口径）。
-        按「线程数量」配置并行计算（单文件出错不影响其它），落库仍单线程按批
-        （每 1000 个）一次性提交，减少落盘开销。stop_event 置位时停止取后续结果，
-        已算出的部分照常落库（与重算取消语义一致）。"""
+        已移除多线程路径：compute_mode=process 时用多进程（绕开 GIL 真并行，大批量回填/重算
+        显著提速）；否则串行（监控小批量够用，且不养子进程、内存最省）。落库仍单线程按批
+        （每 1000 个）一次性提交。stop_event 置位时停止取后续结果，已算出的部分照常落库。"""
         if not paths:
             return
         _BATCH = 1000
@@ -1044,10 +1064,13 @@ class ScannerApp:
         total = len(paths)
         done_cnt = 0
         self.q.put(("status", "计算指标中…"))
-        self.q.put(("status_color", "#0a7d2c"))
+        self.q.put(("status_color", ui_common.COLOR_OK))
         # 计算指标时不再扫描文件夹，「当前扫描」框应离开『上一个文件夹』以免误以为还在扫那个目录
         self.q.put(("current", "计算指标中…（%d 个文件）" % total))
-        for p, res in analysis.compute_paths(paths, self._get_compute_workers(), stop_event):
+        mode = "多进程" if self._use_process() else "串行"
+        for p, res in analysis.compute_paths(
+                paths, self._get_compute_workers(), stop_event,
+                use_process=self._use_process()):
             if stop_event is not None and stop_event.is_set():
                 break  # 用户停止：已算出的 buf 照常落库，剩余文件由『补算缺失指标』兜底
             buf.append((p, res))
@@ -1056,33 +1079,33 @@ class ScannerApp:
                 analysis.upsert_batch(self.conn, self.db_lock, buf)
                 buf = []
                 # 按批回传进度（每批刷新一次，避免逐文件刷 UI）
-                self.q.put(("status", "计算指标中… %d/%d" % (done_cnt, total)))
+                self.q.put(("status", "计算指标中…[%s] %d/%d" % (mode, done_cnt, total)))
         if buf:
             analysis.upsert_batch(self.conn, self.db_lock, buf)
             done_cnt = min(done_cnt, total)
-            self.q.put(("status", "计算指标中… %d/%d" % (done_cnt, total)))
+            self.q.put(("status", "计算指标中…[%s] %d/%d" % (mode, done_cnt, total)))
 
-    def open_recalc_dialog(self):
-        """打开「重新计算指标」对话框：选择月份/设备（可多选）后后台重算。"""
-        if self.thread and self.thread.is_alive():
-            messagebox.showwarning(
-                "扫描进行中",
-                "请先停止扫描。")
+    def _flush_pending(self):
+        """把当前累积的 pending_rows 落库并计算指标（分批落库的落库动作）。
+
+        与 _scan_cycle 内每满 _FLUSH_BATCH 触发的调用共用；外层 _run 在整轮结束后
+        再兜底一次，处理末尾不足一批的残留。这样 pending_rows 不再整轮堆叠，历史
+        回填的内存被锁死在每批 _FLUSH_BATCH 的量级，而非随文件数线性增长。"""
+        if not self.pending_rows:
             return
-        RecalcDialog(self.root, self.conn, self.db_lock, self)
+        insert_processed(self.conn, self.pending_rows, self.db_lock)
+        if self.state.get("compute_after_scan", True):
+            self._compute_metrics_batch([r[0] for r in self.pending_rows], self.stop_event)
+        else:
+            self.q.put(("log", "✔ 已记录 %d 个新增文件（已跳过指标计算，按需在『重新计算指标』中手动计算）。"
+                         % len(self.pending_rows)))
+        self.pending_rows = []
 
-    def open_manual_export_dialog(self):
-        """打开「手动导出」对话框：按产线/设备/月份筛选，选择列，导出到专用目录。"""
-        ManualExportDialog(self.root, self.conn, self)
-
-    def open_compute_new_dialog(self):
-        """打开「补算缺失指标」对话框：仅补齐缺失指标的文件（无 metrics 行，或某指标列为 NULL）。"""
-        if self.thread and self.thread.is_alive():
-            messagebox.showwarning(
-                "扫描进行中",
-                "请先停止扫描。")
-            return
-        ComputeNewDialog(self.root, self.conn, self.db_lock, self)
+    def open_task_center(self):
+        """打开「任务中心」：重新计算指标 / 补算缺失指标 / CSV 导出（手动+自动）
+        整合为一个多标签二级界面，复用产线/设备/月份筛选逻辑。
+        扫描运行中也可打开（重算/补算启动时会校验并拦截；导出用只读子进程不冲突）。"""
+        TaskCenterDialog(self.root, self.conn, self.db_lock, self)
 
     def open_device_list_dialog(self):
         """打开「设备清单」对话框：配置设备号清单（需手动点「从扫描路径嗅探」填充）。"""
@@ -1103,7 +1126,7 @@ class ScannerApp:
         missing_cnt = 0       # 本轮不存在/无目录数（无匹配目录时保持 0）
 
         self.q.put(("status", "监控中…"))
-        self.q.put(("status_color", "#0a0"))
+        self.q.put(("status_color", ui_common.COLOR_OK))
 
         while not self.stop_event.is_set():
             # 每轮直接用已持久化的设备清单拼路径（首次运行前已完成嗅探，不再每轮 listdir）
@@ -1223,14 +1246,8 @@ class ScannerApp:
             # 上报本轮结果 + 持久化（仅新增行落盘，不再全量重写）
             self.state["last_scan_time"] = time.time()
             if self.pending_rows:
-                insert_processed(self.conn, self.pending_rows, self.db_lock)
-                new_paths = [r[0] for r in self.pending_rows]
-                if self.state.get("compute_after_scan", True):
-                    self._compute_metrics_batch(new_paths, self.stop_event)   # 本轮末统一算指标并落库
-                else:
-                    self.q.put(("log", "✔ 已记录 %d 个新增文件（已跳过指标计算，按需在『重新计算指标』中手动计算）。"
-                                 % len(new_paths)))
-                self.pending_rows = []
+                # 分批落库已由 _scan_cycle 内每满 _FLUSH_BATCH 触发；此处兜底处理末尾残留（不足一批的）。
+                self._flush_pending()
             self._save_config()
             # mtime 监控摘要：每轮都报三类目录情况（新增候选数由上方「已枚举 N 个文件，新增候选 X 个」呈现）。
             # 恒等：总目录 == 跳过 + 无目录 + 枚举，方便核对三类统计是否守恒。
@@ -1247,11 +1264,11 @@ class ScannerApp:
                     self.q.put(("status", "本轮全部目录未变化，已跳过（轮询 0）· 监控中"))
                 else:
                     self.q.put(("status", ("本轮完成（无新增）· 监控中" if not backfill else "历史回填完成（无新增）")))
-                self.q.put(("status_color", "#0a0"))
+                self.q.put(("status_color", ui_common.COLOR_OK))
             else:
                 self.q.put(("status", ("本轮完成（处理 %d 个）· 监控中" % done) if not backfill
                             else "历史回填完成（处理 %d 个）" % done))
-                self.q.put(("status_color", "#0a0"))
+                self.q.put(("status_color", ui_common.COLOR_OK))
 
             if backfill:
                 break  # 历史回填为一次性任务，跑完一轮即结束
@@ -1261,7 +1278,7 @@ class ScannerApp:
 
         self._save_config()
         self.q.put(("status", "已停止" if not backfill else "历史回填完成"))
-        self.q.put(("status_color", "#c80" if not backfill else "#0a0"))
+        self.q.put(("status_color", ui_common.COLOR_WARN if not backfill else ui_common.COLOR_OK))
         self.q.put(("finished", 1 if backfill else 0))
 
     def _scan_cycle(self, targets, root_path,
@@ -1386,6 +1403,10 @@ class ScannerApp:
             self.q.put(("status", "处理中（候选 %d 个）" % total))
 
         # 逐个处理候选文件（只统计到文件夹粒度，不逐个显示）
+        # 内存优化：不再整轮累积 pending_rows 到结束才落库，而是累积满 _FLUSH_BATCH 个就
+        # 立即落库并算指标、清空。历史回填一轮可能命中几十万候选，分批可把内存锁死在
+        # 每批量级，避免"随文件数线性增长"。candidates 仍整轮持有（供进度条预估 total），
+        # 但每个处理完的项不再被引用，交由 GC 释放。
         done = 0
         last_folder = None
         for (fpath,) in candidates:
@@ -1408,6 +1429,9 @@ class ScannerApp:
             done += 1
             new_per_folder[folder] = new_per_folder.get(folder, 0) + 1
             self.q.put(("done_count", done))
+            # 分批落库：累积满 _FLUSH_BATCH 个即插库 + 算指标 + 清空，避免整轮堆叠 pending_rows
+            if len(self.pending_rows) >= _FLUSH_BATCH:
+                self._flush_pending()
             # 进度
             if total > 0:
                 self.q.put(("progress", int(done * 100 / total)))
@@ -1470,17 +1494,15 @@ class ScannerApp:
                     self._append_log(msg[1])
                 elif kind == "finished":
                     self.btn_start.config(state="normal")
-                    self.btn_backfill.config(state="normal")
-                    self.btn_pause.config(state="disabled")
+                    self.btn_pause.config(state="disabled", text="暂停")
                     self.btn_stop.config(state="disabled")
                     self._set_path_settings_enabled(True)  # 结束/停止后恢复设置区可编辑
-                    self.btn_pause.config(text="暂停")
                     if msg[1]:  # 历史回填完成：绿字，与正文状态一致
                         self._set_title("历史回填完成", "stop")
-                        self.lbl_status.config(foreground="#0a7d2c")
+                        self.lbl_status.config(foreground=ui_common.COLOR_OK)
                     else:  # 主动停止：红字
                         self._set_title("已停止", "stop")
-                        self.lbl_status.config(foreground="#c00000")
+                        self.lbl_status.config(foreground=ui_common.COLOR_ERR)
                     self.last_var.set(self._fmt_time(self.state.get("last_scan_time", 0)))
                     self.cur_var.set("（无）")
         except Empty:
@@ -1503,7 +1525,7 @@ class ScannerApp:
 
     def _set_folders(self, summary):
         """summary: {folder: (total, new)}。列出【本轮实际轮询到的】文件夹（含新增 0 的），
-        按「设备号 · 月份」展示该月份文件夹的文件数与新增数量。"""
+        直接显示 设备号 · 月份 · 文件数 · 新增数。"""
         self.folder_list.delete(0, tk.END)
         rows = [(d, tot, nw) for d, (tot, nw) in summary.items()]
         if not rows:
@@ -1515,11 +1537,10 @@ class ScannerApp:
             return (dev, ym, item[0])
         for folder, total, new in sorted(rows, key=_key):
             dev, ym = _dev_ym(folder)
-            line = analysis.classify_line(dev)
-            suffix = "（产线%s）" % line if line else ""
+            # 直接显示设备号与月份，去掉产线/文字前缀
             self.folder_list.insert(
-                tk.END, "设备 %s · 月份 %s · 文件 %d 个 · 新增 %d 个%s"
-                % (dev or "?", ym or "?", total, new, suffix))
+                tk.END, "%s · %s · 文件 %d 个 · 新增 %d 个"
+                % (dev or "?", ym or "?", total, new))
         self.folder_list.see(0)
 
     @staticmethod
@@ -1583,118 +1604,38 @@ class ScannerApp:
 
         return box, head_right, inner
 
-    def _auto_column_labels(self):
-        """自动导出可选列（与手动导出相互独立，选择持久化于 scan_state.ini 的 csv_auto_cols，不单独落 json）。"""
-        return [label for label, _ in export_csv.ALL_COLUMNS]
-
-    def _browse_auto_path(self):
-        d = filedialog.askdirectory(initialdir=self.auto_path_var.get() or os.path.expanduser("~"))
-        if d:
-            self.auto_path_var.set(d)
-            self.state["csv_auto_outdir"] = d
-            self._save_config()
-
-    def _write_auto_cols(self):
-        if getattr(self, "_batch_cols", False):
-            return  # 全选/清空批量设置期间不逐项写盘，由调用方最后统一写一次
-        cols = [lbl for lbl, v in self.auto_cols_vars.items() if v.get()]
-        self.state["csv_auto_cols"] = cols
-        self._save_config()
-
-    def _set_all_auto_cols(self, value):
-        """导出列全选 / 清空：批量设置勾选框，最后统一持久化一次。"""
-        self._batch_cols = True
-        try:
-            for v in self.auto_cols_vars.values():
-                v.set(value)
-        finally:
-            self._batch_cols = False
-        self._write_auto_cols()
-
-    def _open_auto_path(self):
-        """在系统文件管理器中打开导出目录（不存在则先创建）。"""
-        d = self.auto_path_var.get().strip()
-        if not d:
-            messagebox.showinfo("导出目录", "请先设置导出目录。")
-            return
-        if not os.path.isdir(d):
-            try:
-                os.makedirs(d, exist_ok=True)
-            except Exception as e:
-                messagebox.showerror("导出目录", "目录不存在且无法创建：%s" % e)
-                return
-        try:
-            os.startfile(d)  # Windows：用默认文件管理器打开
-        except Exception as e:
-            messagebox.showerror("导出目录", "无法打开目录：%s" % e)
-
-    def _on_auto_enabled_toggle(self):
-        """勾选「启用自动导出」即立即开始定时导出；取消勾选即停止并持久化偏好。"""
-        if getattr(self, "_toggling", False):
-            return
-        self._toggling = True
-        try:
-            if self.auto_enabled_var.get():
-                ok = self.start_auto_export(silent=True)
-                if not ok:
-                    # 启动失败（如未设目录/间隔非法）则回滚勾选并保存
-                    self.auto_enabled_var.set(False)
-                    self._save_auto_config(silent=True)
-            else:
-                self.stop_auto_export()
-                # 持久化「取消启用」，避免下次打开又自动开始
-                self._save_auto_config(silent=True)
-        finally:
-            self._toggling = False
-
-    def _save_auto_config(self, silent=False):
-        """校验并持久化自动导出设置到 ini；返回是否成功。
-
-        silent=True 时（来自勾选框/输入框的即时持久化）校验失败不弹窗，
-        仅跳过本次保存，避免打字过程中频繁报错。
-        """
-        try:
-            interval = int(self.auto_interval_var.get().strip())
-        except ValueError:
-            if not silent:
-                messagebox.showerror("间隔无效", "自动导出间隔必须是正整数（分钟）。")
-            return False
-        if interval <= 0:
-            if not silent:
-                messagebox.showerror("间隔无效", "自动导出间隔必须大于 0 分钟。")
-            return False
-        self.state["csv_auto_enabled"] = bool(self.auto_enabled_var.get())
-        self.state["csv_auto_interval_min"] = interval
-        self.state["csv_auto_outdir"] = self.auto_path_var.get().strip()
-        self.state["csv_auto_cols"] = [lbl for lbl, v in self.auto_cols_vars.items() if v.get()]
-        self._save_config()
-        return True
+    # ---------- CSV 自动导出（定时增量；配置 UI 在任务中心「CSV 导出」页） ----------
 
     def start_auto_export(self, silent=False):
-        if not self._save_auto_config(silent=silent):
-            return False
+        """按 state 中已保存的配置启动定时自动导出（UI 值由任务中心先写入 state）。
+        silent=True 供程序启动时自动恢复，失败仅记日志不弹窗。"""
         outdir = self.state.get("csv_auto_outdir", "")
         if not outdir:
             if not silent:
-                messagebox.showerror("目录无效", "请先设置自动导出目录。")
+                messagebox.showerror("目录无效", "请先设置自动导出目录。", parent=self._dlg_parent())
+            return False
+        try:
+            interval = int(self.state.get("csv_auto_interval_min", 60))
+        except (TypeError, ValueError):
+            interval = 0
+        if interval <= 0:
+            if not silent:
+                messagebox.showerror("间隔无效", "自动导出间隔必须大于 0 分钟。", parent=self._dlg_parent())
             return False
         if not os.path.isdir(outdir):
             try:
                 os.makedirs(outdir, exist_ok=True)
             except Exception as e:
                 if not silent:
-                    messagebox.showerror("目录无效", "导出目录无法创建：%s" % e)
+                    messagebox.showerror("目录无效", "导出目录无法创建：%s" % e, parent=self._dlg_parent())
                 return False
-        self._write_auto_cols()
         if self.auto_stop is not None and not self.auto_stop.is_set():
             return True  # 已在运行
         self.auto_stop = threading.Event()
-        interval = self.state.get("csv_auto_interval_min", 60) * 60
         self.auto_thread = threading.Thread(
-            target=self._auto_loop, args=(interval,), daemon=True)
+            target=self._auto_loop, args=(interval * 60,), daemon=True)
         self.auto_thread.start()
-        self.q.put(("log", "▶ 自动导出已启动：每 %d 分钟 → %s"
-                    % (self.state.get("csv_auto_interval_min"), outdir)))
+        self.q.put(("log", "▶ 自动导出已启动：每 %d 分 → %s" % (interval, outdir)))
         return True
 
     def stop_auto_export(self):
@@ -1710,16 +1651,21 @@ class ScannerApp:
         while not stop.wait(interval):
             self._auto_export_once(log=True)
 
-    def _auto_export_once(self, log=False):
+    def _auto_export_once(self, log=False, manual=False):
         outdir = self.state.get("csv_auto_outdir", "")
-        cols = self.state.get("csv_auto_cols") or []
+        cols = self.state.get("csv_cols") or []
         if not outdir:
             if log:
                 self.q.put(("log", "自动导出跳过：未设置导出目录。"))
             return
         import subprocess
+        # 手动触发（全量导出一次）加 --all 强制导出全部现有月份；
+        # 定时自动导出不带 --all，走增量裁决（只导有新增的月份）。
         cmd = [sys.executable, os.path.join(_HERE, "export_csv.py"),
-               "--outdir", outdir, "--cols"] + cols
+               "--outdir", outdir]
+        if manual:
+            cmd.append("--all")
+        cmd += ["--cols"] + cols
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
             if log:
@@ -1728,736 +1674,6 @@ class ScannerApp:
         except Exception as e:
             if log:
                 self.q.put(("log", "自动导出失败：" + str(e)))
-
-
-class RecalcDialog(tk.Toplevel):
-    """选择月份（可多选）与设备（可多选）后，后台线程按条件重算指标。
-    月份/设备留空均表示「不限」，二者都留空 = 全量重算。"""
-
-    def __init__(self, parent, conn, db_lock, app):
-        super().__init__(parent)
-        self.withdraw()   # 先隐藏，避免默认位置闪现后再跳到居中
-        self._alive = True  # 对话框是否已销毁（后台重算线程据此决定是否更新控件）
-        self._last_wrap_w = 0  # 自适应换行缓存的上次宽度（避免重复触发）
-        self.conn = conn
-        self.db_lock = db_lock
-        self.app = app
-        self._cur_ym = []   # 本次重算实际选中的月份（供日志使用）
-        self._cur_dev = []  # 本次重算实际选中的设备（供日志使用）
-        self.title("重新计算指标 - 选择月份/设备")
-        self.geometry("620x720")
-        self.resizable(True, True)   # 可缩放，并保留最大/最小化按钮（不再 transient）
-        # 居中于主窗口
-        self.update_idletasks()
-        self.geometry("+%d+%d" % (
-            parent.winfo_rootx() + max(0, (parent.winfo_width() - self.winfo_width()) // 2),
-            parent.winfo_rooty() + max(0, (parent.winfo_height() - self.winfo_height()) // 2)))
-        # 按钮样式：保持默认字号（9），仅收窄内边距
-        try:
-            _st = ttk.Style()
-            _st.configure("Small.TButton", font=("Microsoft YaHei", 9), padding=(2, 2))
-        except Exception:
-            pass
-        self._build()
-        self._load_devices()
-        self._load_months()
-        self.deiconify()   # 定位完毕后再显示，消除闪烁
-        self.lift()
-
-    def destroy(self):
-        # 标记已销毁：后台重算线程(_worker)完成后的回调(_finish)不再触碰控件，避免 TclError
-        self._alive = False
-        super().destroy()
-
-    def _build(self):
-        # 底部固定区：操作按钮 + 选择提示/状态，side=bottom 先占位，始终可见、不被顶部挤压
-        frm_bottom = ttk.Frame(self)
-        frm_bottom.pack(side="bottom", fill="x", padx=10, pady=(4, 6))
-
-        # 顶部列表区：作为容器，剩余垂直空间交由下方设备/月份列表框按比例吸收，
-        # 自身不再 expand 独占空间（否则多余高度被空 Frame 吃掉，月份框下方留白）
-        frm_top = ttk.Frame(self)
-        frm_top.pack(side="top", fill="both", expand=True)
-
-        lf = ttk.Frame(frm_top)
-        lf.pack(anchor="w", padx=10, pady=(8, 2))
-        ttk.Label(lf, text="产线(可复选):").pack(side="left")
-        self.line_vars = {}
-        for _ln in ("E", "C", "D", "A"):
-            _v = tk.BooleanVar()
-            self.line_vars[_ln] = _v
-            ttk.Checkbutton(lf, text=_ln, variable=_v,
-                            command=lambda: (self._apply_line(),
-                                             self._update_sel_label())).pack(side="left", padx=2)
-
-        # 设备（多选，留空=全部设备）—— 带 LabelFrame 外框，Listbox 去边框，与导出列融为一体
-        dev_frame = ttk.LabelFrame(frm_top, text="设备（可多选，留空=全部设备）")
-        dev_frame.pack(fill="both", expand=True, padx=10, pady=(8, 2))
-        self.dev_listbox = tk.Listbox(dev_frame, selectmode="multiple", height=5,
-                                      exportselection=False, borderwidth=0, relief="flat")
-        # 设备列表框随窗口拉伸伸长（fill=both+expand），吸收剩余高度，避免月份框下方留白
-        self.dev_listbox.pack(side="left", fill="both", expand=True, pady=2)
-        dev_sb = ttk.Scrollbar(dev_frame, command=self.dev_listbox.yview)
-        dev_sb.pack(side="right", fill="y")
-        self.dev_listbox.config(yscrollcommand=dev_sb.set)
-        self.dev_listbox.bind("<<ListboxSelect>>",
-                              lambda e: self._update_sel_label())
-
-        # 月份（多选，留空=全部月份）—— 带 LabelFrame 外框，Listbox 去边框，与设备/导出列融为一体
-        frm = ttk.LabelFrame(frm_top, text="月份（可多选，Ctrl/Shift 连选；留空=全部月份）")
-        frm.pack(fill="both", expand=True, padx=10, pady=4)
-        self.mth_listbox = tk.Listbox(frm, selectmode="multiple", height=6,
-                                      exportselection=False, borderwidth=0, relief="flat")
-        # 月份列表框随窗口拉伸伸长（fill=both+expand），吸收剩余高度，避免下方留白
-        self.mth_listbox.pack(side="left", fill="both", expand=True, pady=2)
-        sb = ttk.Scrollbar(frm, command=self.mth_listbox.yview)
-        sb.pack(side="right", fill="y")
-        self.mth_listbox.config(yscrollcommand=sb.set)
-        self.mth_listbox.bind("<<ListboxSelect>>",
-                              lambda e: self._update_sel_label())
-
-        bf = ttk.Frame(frm_bottom)
-        bf.pack(fill="x", pady=(2, 4))
-        ttk.Button(bf, text="全选月", style="Small.TButton",
-                   command=lambda: self.mth_listbox.selection_set(0, "end")).pack(side="left", padx=2)
-        ttk.Button(bf, text="清月", style="Small.TButton",
-                   command=lambda: self.mth_listbox.selection_clear(0, "end")).pack(side="left", padx=2)
-        ttk.Button(bf, text="全选设备", style="Small.TButton",
-                   command=lambda: self.dev_listbox.selection_set(0, "end")).pack(side="left", padx=2)
-        ttk.Button(bf, text="清设备", style="Small.TButton",
-                   command=lambda: self.dev_listbox.selection_clear(0, "end")).pack(side="left", padx=2)
-
-        self.prog = ttk.Progressbar(frm_bottom, orient="horizontal",
-                                    mode="determinate", maximum=100)
-        self.prog.pack(fill="x", padx=0, pady=(2, 4))
-
-        af = ttk.Frame(frm_bottom)
-        af.pack(fill="x", pady=(0, 4))
-        self.btn_ok = ttk.Button(af, text="确定", style="Small.TButton", command=self._on_ok)
-        self.btn_ok.pack(side="right", padx=2)
-        self.btn_cancel = ttk.Button(af, text="取消", style="Small.TButton",
-                                     command=self._cancel, state="disabled")
-        self.btn_cancel.pack(side="right", padx=2)
-
-        self.sel_label = ttk.Label(frm_bottom, text="", foreground="#1a73e8",
-                                   anchor="w")
-        self.sel_label.pack(anchor="w", padx=10, pady=(2, 0))
-        # ttk.Label 不支持 height；用固定高度容器容纳状态文字（加高状态区、可换行、顶部对齐）
-        status_holder = ttk.Frame(frm_bottom, height=80)
-        status_holder.pack(fill="x", padx=10, pady=4)
-        status_holder.pack_propagate(False)  # 固定高度，不随内容收缩
-        self.status = ttk.Label(status_holder, text="", foreground="#1a73e8",
-                                anchor="nw", justify="left")
-        self.status.pack(fill="both", expand=True)
-        # 随窗口宽度自适应换行：窗口缩放时按实际宽度重设 wraplength
-        self.bind("<Configure>", self._on_configure)
-        self._on_configure()
-        self._stop_event = threading.Event()
-        self._running = False  # 仅在点击“确定”开始重算后才为 True
-        self.protocol("WM_DELETE_WINDOW", self._cancel)
-
-    def _on_configure(self, event=None):
-        """窗口尺寸变化时，让下方文字标签按实际宽度自适应换行（避免写死 wraplength）。
-        缓存上次宽度，宽度未变则跳过，避免子控件 Configure 事件冒泡导致的反复触发。"""
-        w = self.winfo_width() - 20  # 减去左右各 10px 内边距
-        if w < 60:
-            w = 60
-        if getattr(self, "_last_wrap_w", None) == w:
-            return
-        self._last_wrap_w = w
-        try:
-            self.sel_label.configure(wraplength=w)
-            self.status.configure(wraplength=w)
-        except tk.TclError:
-            pass
-
-    def _load_devices(self):
-        try:
-            rows = [r[0] for r in self.conn.execute(
-                "SELECT DISTINCT device FROM processed "
-                "WHERE device IS NOT NULL AND device <> '' ORDER BY device")]
-        except Exception:
-            rows = []
-        for d in rows:
-            self.dev_listbox.insert("end", d)
-        # 设备默认不预选（=不限设备），避免误把重算范围缩到某设备
-        self._apply_line()  # 按当前产线自动勾选对应设备号
-
-    def _apply_line(self):
-        """按选中的产线自动勾选设备列表框中匹配的设备号（可多选联动）。
-        未选中任何产线 = 不限设备（清空选择）。
-        """
-        lines = [ln for ln, v in self.line_vars.items() if v.get()]
-        self.dev_listbox.selection_clear(0, "end")
-        if not lines:
-            return
-        for i in range(self.dev_listbox.size()):
-            if analysis.classify_line(self.dev_listbox.get(i)) in lines:
-                self.dev_listbox.selection_set(i)
-
-    def _update_sel_label(self):
-        """始终显示当前选中的产线/设备/月份，避免焦点切换后看不出选择了什么。"""
-        if not getattr(self, "_alive", True):
-            return
-        line = "/".join(ln for ln, v in self.line_vars.items() if v.get()) or "（不限）"
-        ndev = len(self.dev_listbox.curselection())
-        ndev_total = self.dev_listbox.size()
-        nym = len(self.mth_listbox.curselection())
-        nym_total = self.mth_listbox.size()
-        # 未选择 = 不限（全部）：避免把“0/N”误读成“选了 0 个=不重算”
-        dev_txt = "全部设备" if ndev == 0 else "%d/%d" % (ndev, ndev_total)
-        ym_txt = "全部月份" if nym == 0 else "%d/%d" % (nym, nym_total)
-        self.sel_label.config(
-            text="当前选择 → 产线: %s | 设备: %s | 月份: %s"
-                 % (line, dev_txt, ym_txt))
-
-    def _load_months(self):
-        try:
-            rows = [r[0] for r in self.conn.execute(
-                "SELECT DISTINCT ym FROM processed "
-                "WHERE ym IS NOT NULL AND ym <> '' ORDER BY ym")]
-        except Exception:
-            rows = []
-        for ym in rows:
-            self.mth_listbox.insert("end", ym)
-        if rows:
-            self.mth_listbox.selection_set(0, "end")  # 默认全选月份，避免误漏
-        self._update_sel_label()
-
-    def _on_ok(self):
-        self._cur_ym = [self.mth_listbox.get(i) for i in self.mth_listbox.curselection()]
-        self._cur_dev = [self.dev_listbox.get(i) for i in self.dev_listbox.curselection()]
-        self._stop_event.clear()
-        self.status.config(text="重算中…")
-        self.prog.configure(value=0)
-        self.mth_listbox.configure(state="disabled")
-        self.dev_listbox.configure(state="disabled")
-        self.btn_ok.configure(state="disabled")
-        self.btn_cancel.configure(state="normal")
-        self._running = True
-        threading.Thread(target=self._worker, args=(self._cur_ym, self._cur_dev), daemon=True).start()
-
-    def _cancel(self):
-        """取消重算：设置停止事件，后台线程会在文件间隙中断；对话框保持至线程结束。"""
-        if getattr(self, "_stop_event", None) is None:
-            self.destroy()
-            return
-        # 重算尚未开始（打开后直接点取消/关闭）→ 直接关闭对话框
-        if not getattr(self, "_running", False):
-            self.destroy()
-            return
-        self._stop_event.set()
-        try:
-            self.status.config(text="正在取消（请稍候）…")
-            self.btn_cancel.configure(state="disabled")
-        except tk.TclError:
-            pass
-
-    def _progress_cb(self):
-        """返回一个进度回调：供 analysis 重算函数在后台线程把进度推到对话框内进度条。"""
-        prog = self.prog
-        def _cb(done, total):
-            if total > 0:
-                pct = int(done * 100 / total)
-                self.after(0, lambda: prog.configure(value=pct))
-        return _cb
-
-    def _worker(self, ym_sel, dev_sel):
-        self.after(0, lambda: self.prog.configure(value=0))
-        try:
-            n = analysis.recalc_by_months(self.conn, self.db_lock, ym_sel, dev_sel,
-                                          on_progress=self._progress_cb(),
-                                          stop_event=self._stop_event,
-                                          workers=self.app._get_compute_workers() if self.app else None)
-            conds, params = [], []
-            if ym_sel:
-                ph = ",".join("?" * len(ym_sel))
-                conds.append(f"ym IN ({ph})"); params.extend(ym_sel)
-            if dev_sel:
-                ph = ",".join("?" * len(dev_sel))
-                conds.append(f"device IN ({ph})"); params.extend(dev_sel)
-            where = ("WHERE " + " AND ".join(conds)) if conds else ""
-            rows = self.conn.execute(
-                f"SELECT DISTINCT device, ym FROM processed {where}", params).fetchall()
-            devs = sorted({r[0] for r in rows if r[0]})
-            yms = sorted({r[1] for r in rows if r[1]})
-            msg = "已完成：重算 %d 个文件" % n
-            parts = []
-            if ym_sel:
-                parts.append("月份：" + ", ".join(ym_sel))
-            if dev_sel:
-                parts.append("设备：" + ", ".join(dev_sel))
-            msg += "（" + ("；".join(parts) if parts else "全量") + "）"
-        except Exception as e:
-            n, devs, yms = 0, [], []
-            msg = "重算出错：" + str(e)
-        if getattr(self, "_stop_event", None) and self._stop_event.is_set() and "出错" not in msg:
-            msg = "已取消（已处理 %d 个）" % n
-        self.after(0, lambda: self._finish(msg, devs, yms))
-
-    def _finish(self, msg, devs=None, yms=None):
-        # 重算已完成，先把结果写入日志文件 / 主界面事件日志（对话框已关闭也安全）
-        if devs is not None:
-            self._write_recalc_log(msg, devs, yms or [])
-        if not getattr(self, "_alive", True):
-            return
-        try:
-            self.status.config(text=msg)
-            self.mth_listbox.configure(state="normal")
-            self.dev_listbox.configure(state="normal")
-            self.btn_ok.configure(state="normal")
-            self.btn_cancel.configure(state="disabled")
-        except tk.TclError:
-            pass
-        self._running = False  # 重算结束（完成或取消），允许再次关闭对话框
-
-    def _write_recalc_log(self, msg, devs, yms):
-        """将本次重算的范围与计算到的文件夹(设备)写入日志文件，并同步到主界面事件日志。"""
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        ym_sel = getattr(self, "_cur_ym", []) or []
-        dev_sel = getattr(self, "_cur_dev", []) or []
-        lines = ["[%s] %s" % (ts, msg)]
-        lines.append("  产线: %s" % ("/".join(ln for ln, v in self.line_vars.items() if v.get()) or "（不限）"))
-        lines.append("  月份: %s" % (", ".join(ym_sel) if ym_sel else "全部"))
-        lines.append("  设备: %s" % (", ".join(dev_sel) if dev_sel else "全部"))
-        lines.append("  计算的文件夹(设备): %s" % (", ".join(devs) if devs else "(无)"))
-        if yms:
-            lines.append("  涉及月份: %s" % ", ".join(yms))
-        text = "\n".join(lines) + "\n"
-        try:
-            with open(RECALC_LOG, "a", encoding="utf-8") as f:
-                f.write(text + "\n")
-        except Exception:
-            pass
-        if self.app:
-            for ln in lines:
-                self.app._append_log(ln)
-
-
-class ComputeNewDialog(RecalcDialog):
-    """『补算缺失指标』：仅补齐缺失指标的文件（无 metrics 行，或某指标列为 NULL）。
-    复用 RecalcDialog 的月份/设备选择 UI 与日志写入，仅替换执行函数为 recalc_missing。"""
-
-    def __init__(self, parent, conn, db_lock, app):
-        super().__init__(parent, conn, db_lock, app)
-        self.title("补算缺失指标 - 选择月份/设备")
-        self.status.config(text="将仅补齐缺失指标的文件（未算指标 / 缺新指标列）")
-
-    def _on_ok(self):
-        self._cur_ym = [self.mth_listbox.get(i) for i in self.mth_listbox.curselection()]
-        self._cur_dev = [self.dev_listbox.get(i) for i in self.dev_listbox.curselection()]
-        self._stop_event.clear()
-        self.status.config(text="补齐中…")
-        self.prog.configure(value=0)
-        self.mth_listbox.configure(state="disabled")
-        self.dev_listbox.configure(state="disabled")
-        self.btn_ok.configure(state="disabled")
-        self.btn_cancel.configure(state="normal")
-        self._running = True
-        threading.Thread(target=self._worker, args=(self._cur_ym, self._cur_dev), daemon=True).start()
-
-    def _worker(self, ym_sel, dev_sel):
-        self.after(0, lambda: self.prog.configure(value=0))
-        try:
-            n = analysis.recalc_missing(self.conn, self.db_lock, ym_sel, dev_sel,
-                                        on_progress=self._progress_cb(),
-                                        stop_event=self._stop_event,
-                                        workers=self.app._get_compute_workers() if self.app else None)
-            conds, params = [], []
-            if ym_sel:
-                ph = ",".join("?" * len(ym_sel))
-                conds.append(f"ym IN ({ph})"); params.extend(ym_sel)
-            if dev_sel:
-                ph = ",".join("?" * len(dev_sel))
-                conds.append(f"device IN ({ph})"); params.extend(dev_sel)
-            where = ("WHERE " + " AND ".join(conds)) if conds else ""
-            rows = self.conn.execute(
-                f"SELECT DISTINCT device, ym FROM processed {where}", params).fetchall()
-            devs = sorted({r[0] for r in rows if r[0]})
-            yms = sorted({r[1] for r in rows if r[1]})
-            msg = "已完成：补齐缺失指标 %d 个文件" % n
-            parts = []
-            if ym_sel:
-                parts.append("月份：" + ", ".join(ym_sel))
-            if dev_sel:
-                parts.append("设备：" + ", ".join(dev_sel))
-            msg += "（" + ("；".join(parts) if parts else "全量") + "）"
-        except Exception as e:
-            n, devs, yms = 0, [], []
-            msg = "补齐出错：" + str(e)
-        if getattr(self, "_stop_event", None) and self._stop_event.is_set() and "出错" not in msg:
-            msg = "已取消（已处理 %d 个）" % n
-        self.after(0, lambda: self._finish(msg, devs, yms))
-
-
-class ManualExportDialog(tk.Toplevel):
-    """手动导出：按产线/设备/月份筛选，选择导出列，导出到专用目录（csv_manual_outdir）。
-    复用 RecalcDialog 的产线/设备/月份多选联动 UI；底层调用 export_csv.py 子进程（只读 DB）。"""
-
-    def __init__(self, parent, conn, app):
-        super().__init__(parent)
-        self.withdraw()   # 先隐藏，避免默认位置闪现后再跳到居中
-        self.conn = conn
-        self.app = app
-        self._alive = True
-        self._batch_cols = False
-        self._last_wrap_w = 0
-        self.title("手动导出 CSV")
-        self.geometry("810x1080")
-        self.resizable(True, True)
-        self.transient(parent)   # 始终位于主窗口之上，避免浏览/打开目录后主界面抢到前台
-        # 居中于主窗口
-        self.update_idletasks()
-        self.geometry("+%d+%d" % (
-            parent.winfo_rootx() + max(0, (parent.winfo_width() - self.winfo_width()) // 2),
-            parent.winfo_rooty() + max(0, (parent.winfo_height() - self.winfo_height()) // 2)))
-        try:
-            _st = ttk.Style()
-            _st.configure("Small.TButton", font=("Microsoft YaHei", 9), padding=(2, 2))
-        except Exception:
-            pass
-        self.line_vars = {}
-        self.col_vars = {}
-        self._build()
-        self._load_devices()
-        self._load_months()
-        self.deiconify()   # 定位完毕后再显示，消除闪烁
-        self.lift()
-
-    def destroy(self):
-        self._alive = False
-        super().destroy()
-
-    def _build(self):
-        # 底部固定区：操作按钮 + 选择提示/状态
-        frm_bottom = ttk.Frame(self)
-        frm_bottom.pack(side="bottom", fill="x", padx=10, pady=(4, 6))
-        # 顶部列表区
-        frm_top = ttk.Frame(self)
-        frm_top.pack(side="top", fill="both", expand=True)
-
-        # 产线（复选，联动设备）
-        lf = ttk.Frame(frm_top)
-        lf.pack(anchor="w", padx=10, pady=(8, 2))
-        ttk.Label(lf, text="产线(可复选):").pack(side="left")
-        for _ln in ("E", "C", "D", "A"):
-            _v = tk.BooleanVar()
-            self.line_vars[_ln] = _v
-            ttk.Checkbutton(lf, text=_ln, variable=_v,
-                            command=lambda: (self._apply_line(),
-                                             self._update_sel_label())).pack(side="left", padx=2)
-
-        # 设备（多选，留空=全部）—— 带 LabelFrame 外框，滚动条同导出列的右侧独立列样式
-        dev_frame = ttk.LabelFrame(frm_top, text="设备（可多选，留空=全部设备）")
-        dev_frame.pack(fill="both", expand=True, padx=10, pady=(8, 2))
-        dev_inner = ttk.Frame(dev_frame)
-        dev_inner.pack(fill="both", expand=True, pady=2)
-        self.dev_listbox = tk.Listbox(dev_inner, selectmode="multiple", height=5, exportselection=False, borderwidth=0, relief="flat")
-        self.dev_listbox.pack(side="left", fill="both", expand=True)
-        dev_sb = ttk.Scrollbar(dev_inner, command=self.dev_listbox.yview)
-        dev_sb.pack(side="right", fill="y")
-        self.dev_listbox.config(yscrollcommand=dev_sb.set)
-        self.dev_listbox.bind("<<ListboxSelect>>", lambda e: self._update_sel_label())
-
-        # 月份（多选，留空=全部月份）—— 带 LabelFrame 外框，滚动条同导出列的右侧独立列样式
-        mth_frame = ttk.LabelFrame(frm_top, text="月份（可多选，Ctrl/Shift 连选；留空=全部月份）")
-        mth_frame.pack(fill="both", expand=True, padx=10, pady=4)
-        mth_inner = ttk.Frame(mth_frame)
-        mth_inner.pack(fill="both", expand=True, pady=2)
-        self.mth_listbox = tk.Listbox(mth_inner, selectmode="multiple", height=6, exportselection=False, borderwidth=0, relief="flat")
-        self.mth_listbox.pack(side="left", fill="both", expand=True)
-        mth_sb = ttk.Scrollbar(mth_inner, command=self.mth_listbox.yview)
-        mth_sb.pack(side="right", fill="y")
-        self.mth_listbox.config(yscrollcommand=mth_sb.set)
-        self.mth_listbox.bind("<<ListboxSelect>>", lambda e: self._update_sel_label())
-
-        # 导出列（复选，留空=全部列）
-        cf = ttk.LabelFrame(frm_top, text="导出列（可复选，留空=全部列）")
-        cf.pack(fill="x", padx=10, pady=(8, 2))
-        # 可滚动的勾选区：高度按列数动态加高，封顶 300px，再高走滚动条；
-        # 既紧凑（列少不空白）又不撑高对话框。
-        _cols = [label for label, _ in export_csv.ALL_COLUMNS]
-        _saved = self.app.state.get("csv_manual_cols") or []
-        _ncol = 3
-        _manual_rows = max(1, (len(_cols) + _ncol - 1) // _ncol)
-        _MANUAL_BOX_H = min(max(90, _manual_rows * 22 + 8), 300)
-        self.col_frame = ttk.Frame(cf, borderwidth=1, relief="solid")
-        self.col_frame.pack(fill="x", padx=6, pady=4)
-        _col_canv = tk.Canvas(self.col_frame, highlightthickness=0, height=_MANUAL_BOX_H)
-        _col_sb = ttk.Scrollbar(self.col_frame, orient="vertical",
-                                command=_col_canv.yview)
-        _col_inner = ttk.Frame(_col_canv)
-        _col_inner.bind("<Configure>",
-                        lambda e: _col_canv.configure(
-                            scrollregion=_col_canv.bbox("all")))
-        _col_win = _col_canv.create_window((0, 0), window=_col_inner, anchor="nw")
-        _col_canv.bind("<Configure>",
-                       lambda e: _col_canv.itemconfigure(_col_win, width=e.width))
-        _col_canv.configure(yscrollcommand=_col_sb.set)
-        _col_canv.pack(side="left", fill="both", expand=True)
-        _col_sb.pack(side="right", fill="y")
-        # 鼠标滚轮（中键/触控板）滚动：Canvas 自定义容器无原生滚轮，需手动绑定
-        _col_canv.bind("<MouseWheel>",
-                       lambda e: _col_canv.yview_scroll(int(-e.delta / 120), "units"))
-        _col_canv.bind("<Button-4>",
-                       lambda e: _col_canv.yview_scroll(-1, "units"))
-        _col_canv.bind("<Button-5>",
-                       lambda e: _col_canv.yview_scroll(1, "units"))
-        # 自适应列数：按 Canvas 可用宽度估算每行列数，窗口拉伸时自动重排
-        _COL_W = 150  # 每列估算像素宽度
-        _col_widgets = []
-        for _label in _cols:
-            _v = tk.BooleanVar(value=(_label in _saved) if _saved else True)
-            self.col_vars[_label] = _v
-            _col_widgets.append(
-                ttk.Checkbutton(_col_inner, text=_label, variable=_v,
-                                command=self._write_manual_cols))
-
-        def _relayout_cols():
-            _w = _col_canv.winfo_width()
-            # 每列预留 padx 余量，避免最右列被 Canvas 边缘裁切、名称显示不全
-            _n = max(1, _w // (_COL_W + 10))
-            for _i, _wd in enumerate(_col_widgets):
-                _wd.grid(row=_i // _n, column=_i % _n, sticky="w", padx=4, pady=1)
-            _col_canv.configure(scrollregion=_col_canv.bbox("all"))
-        _col_canv.bind("<Configure>", lambda e: _relayout_cols())
-
-        # 导出列的全选/清空按钮（放在导出列复选框之后）
-        bf_cols = ttk.Frame(cf)
-        bf_cols.pack(fill="x", padx=6, pady=(2, 6))
-        ttk.Button(bf_cols, text="全选列", style="Small.TButton",
-                   command=self._set_all_cols_true).pack(side="left", padx=2)
-        ttk.Button(bf_cols, text="清列", style="Small.TButton",
-                   command=self._set_all_cols_false).pack(side="left", padx=2)
-
-        # 导出目录（专用：csv_manual_outdir）
-        df = ttk.Frame(frm_top)
-        df.pack(fill="x", padx=10, pady=(8, 2))
-        ttk.Label(df, text="导出目录：").pack(side="left")
-        self.outdir_var = tk.StringVar(value=self.app.state.get("csv_manual_outdir", ""))
-        self.entry_outdir = ttk.Entry(df, textvariable=self.outdir_var)
-        self.entry_outdir.pack(side="left", fill="x", expand=True, padx=(4, 4))
-        ttk.Button(df, text="浏览...", command=self._browse).pack(side="left")
-        ttk.Button(df, text="打开目录", command=self._open_dir).pack(side="left", padx=(4, 0))
-
-        # 批量按钮
-        bf = ttk.Frame(frm_bottom)
-        bf.pack(fill="x", pady=(2, 4))
-        ttk.Button(bf, text="全选月", style="Small.TButton",
-                   command=lambda: self.mth_listbox.selection_set(0, "end")).pack(side="left", padx=2)
-        ttk.Button(bf, text="清月", style="Small.TButton",
-                   command=lambda: self.mth_listbox.selection_clear(0, "end")).pack(side="left", padx=2)
-        ttk.Button(bf, text="全选设备", style="Small.TButton",
-                   command=lambda: self.dev_listbox.selection_set(0, "end")).pack(side="left", padx=2)
-        ttk.Button(bf, text="清设备", style="Small.TButton",
-                   command=lambda: self.dev_listbox.selection_clear(0, "end")).pack(side="left", padx=2)
-
-        # 导出 / 关闭
-        af = ttk.Frame(frm_bottom)
-        af.pack(fill="x", pady=(0, 4))
-        self.btn_export = ttk.Button(af, text="导出", style="Small.TButton", command=self._on_export)
-        self.btn_export.pack(side="right", padx=2)
-        ttk.Button(af, text="关闭", style="Small.TButton", command=self.destroy).pack(side="right", padx=2)
-
-        # 导出进度条（确定型：按「已完成月份 / 总月份」推进）
-        self.progress = ttk.Progressbar(frm_bottom, mode="determinate", maximum=1)
-        self.progress.pack(fill="x", padx=10, pady=(6, 2))
-
-        self.sel_label = ttk.Label(frm_bottom, text="", foreground="#1a73e8", anchor="w")
-        self.sel_label.pack(anchor="w", padx=10, pady=(2, 0))
-        status_holder = ttk.Frame(frm_bottom, height=80)
-        status_holder.pack(fill="x", padx=10, pady=4)
-        status_holder.pack_propagate(False)
-        self.status = ttk.Label(status_holder, text="", foreground="#1a73e8", anchor="nw", justify="left")
-        self.status.pack(fill="both", expand=True)
-        self.bind("<Configure>", self._on_configure)
-        self._on_configure()
-
-    def _on_configure(self, event=None):
-        w = self.winfo_width() - 20
-        if w < 60:
-            w = 60
-        if getattr(self, "_last_wrap_w", None) == w:
-            return
-        self._last_wrap_w = w
-        try:
-            self.sel_label.configure(wraplength=w)
-            self.status.configure(wraplength=w)
-        except tk.TclError:
-            pass
-
-    def _load_devices(self):
-        try:
-            rows = [r[0] for r in self.conn.execute(
-                "SELECT DISTINCT device FROM processed "
-                "WHERE device IS NOT NULL AND device <> '' ORDER BY device")]
-        except Exception:
-            rows = []
-        for d in rows:
-            self.dev_listbox.insert("end", d)
-        self._apply_line()
-
-    def _apply_line(self):
-        """按选中的产线自动勾选设备列表框中匹配的设备号（可多选联动）；未选产线=不限设备。"""
-        lines = [ln for ln, v in self.line_vars.items() if v.get()]
-        self.dev_listbox.selection_clear(0, "end")
-        if not lines:
-            return
-        for i in range(self.dev_listbox.size()):
-            if analysis.classify_line(self.dev_listbox.get(i)) in lines:
-                self.dev_listbox.selection_set(i)
-
-    def _load_months(self):
-        try:
-            rows = [r[0] for r in self.conn.execute(
-                "SELECT DISTINCT ym FROM processed "
-                "WHERE ym IS NOT NULL AND ym <> '' ORDER BY ym")]
-        except Exception:
-            rows = []
-        for m in rows:
-            self.mth_listbox.insert("end", m)
-
-    def _update_sel_label(self):
-        if not getattr(self, "_alive", True):
-            return
-        line = "/".join(ln for ln, v in self.line_vars.items() if v.get()) or "（不限）"
-        ndev = len(self.dev_listbox.curselection())
-        ndev_total = self.dev_listbox.size()
-        nym = len(self.mth_listbox.curselection())
-        nym_total = self.mth_listbox.size()
-        ncol = sum(1 for v in self.col_vars.values() if v.get())
-        ncol_total = len(self.col_vars)
-        dev_txt = "全部设备" if ndev == 0 else "%d/%d" % (ndev, ndev_total)
-        ym_txt = "全部月份" if nym == 0 else "%d/%d" % (nym, nym_total)
-        col_txt = "全部列" if ncol == 0 else "%d/%d" % (ncol, ncol_total)
-        self.sel_label.config(
-            text="当前选择 → 产线: %s | 设备: %s | 月份: %s | 列: %s"
-                 % (line, dev_txt, ym_txt, col_txt))
-
-    def _write_manual_cols(self):
-        if getattr(self, "_batch_cols", False):
-            return
-        cols = [lbl for lbl, v in self.col_vars.items() if v.get()]
-        self.app.state["csv_manual_cols"] = cols
-        self.app._save_config()
-        self._update_sel_label()
-
-    def _set_all_cols_true(self):
-        self._batch_cols = True
-        for v in self.col_vars.values():
-            v.set(True)
-        self._batch_cols = False
-        self.app.state["csv_manual_cols"] = list(self.col_vars.keys())
-        self.app._save_config()
-        self._update_sel_label()
-
-    def _set_all_cols_false(self):
-        self._batch_cols = True
-        for v in self.col_vars.values():
-            v.set(False)
-        self._batch_cols = False
-        self.app.state["csv_manual_cols"] = []
-        self.app._save_config()
-        self._update_sel_label()
-
-    def _browse(self):
-        d = filedialog.askdirectory(parent=self,
-                                    initialdir=self.outdir_var.get() or os.path.expanduser("~"))
-        if d:
-            self.outdir_var.set(d)
-            self.app.state["csv_manual_outdir"] = d
-            self.app._save_config()
-        # 文件对话框关闭后，把焦点拉回本弹窗（避免主界面抢到前台）
-        self.lift()
-        self.focus_force()
-
-    def _open_dir(self):
-        p = self.outdir_var.get().strip()
-        if not p:
-            messagebox.showinfo("打开目录", "请先设置导出目录。")
-            return
-        if not os.path.isdir(p):
-            messagebox.showerror("打开目录", "目录不存在：\n%s" % p)
-            return
-        try:
-            os.startfile(p)
-        except Exception as e:
-            messagebox.showerror("打开目录", "无法打开目录：%s" % e)
-
-    def _log(self, msg):
-        """把手动导出状态同步写入主界面『事件日志』面板（带时间戳、可滚动、完整显示）。"""
-        try:
-            self.app.q.put(("log", msg))
-        except Exception:
-            pass
-
-    def _on_export(self):
-        outdir = self.outdir_var.get().strip()
-        if not outdir:
-            messagebox.showerror("目录无效", "请先设置导出目录。")
-            return
-        cols = [lbl for lbl, v in self.col_vars.items() if v.get()]
-        if not cols:
-            messagebox.showwarning("列未选", "请至少选择一列导出。")
-            return
-        lines = [ln for ln, v in self.line_vars.items() if v.get()]
-        dev_set = set(self.dev_listbox.get(i) for i in self.dev_listbox.curselection())
-        if lines:
-            for i in range(self.dev_listbox.size()):
-                if analysis.classify_line(self.dev_listbox.get(i)) in lines:
-                    dev_set.add(self.dev_listbox.get(i))
-        months = [self.mth_listbox.get(i) for i in self.mth_listbox.curselection()]
-        if not months:
-            # 未选月份 = 全部月份：从库里取全量明细，逐月导出以便显示进度
-            try:
-                months = [r[0] for r in self.conn.execute(
-                    "SELECT DISTINCT ym FROM processed "
-                    "WHERE ym IS NOT NULL AND ym <> '' ORDER BY ym")]
-            except Exception:
-                months = []
-        total = len(months)
-        # 持久化手动导出设置（专用目录 + 列）
-        self.app.state["csv_manual_outdir"] = outdir
-        self.app.state["csv_manual_cols"] = cols
-        self.app._save_config()
-        self.btn_export.config(state="disabled")
-        self.progress["value"] = 0
-        self.progress["maximum"] = total if total > 0 else 1
-        threading.Thread(target=self._export_worker,
-                         args=(outdir, sorted(dev_set), months, cols),
-                         daemon=True).start()
-
-    def _export_worker(self, outdir, devices, months, cols):
-        import subprocess
-        script = os.path.join(_HERE, "export_csv.py")
-        logs = []
-        total = len(months)
-        self._log("手动导出开始 → 目录=%s | 设备=%s | 列=%d个 | 月份=%d个"
-                  % (outdir, "、".join(devices) if devices else "全部", len(cols), total))
-        try:
-            if not months:
-                self._log("手动导出：没有可导出的月份（数据库为空）。")
-                self.after(0, lambda: self.status.config(text="没有可导出的月份（数据库为空）。"))
-            for idx, m in enumerate(months, 1):
-                cmd = [sys.executable, script, "--outdir", outdir, "--ym", m, "--cols"] + cols
-                if devices:
-                    cmd += ["--device"] + devices
-                self._log("手动导出 正在导出 %s … (%d/%d)" % (m, idx, total))
-                self.after(0, lambda idx=idx, total=total, m=m: (
-                    self.status.config(text="正在导出 %s … (%d/%d)" % (m, idx, total)),
-                    self.progress.config(value=idx),
-                ))
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-                logs.append((res.stdout or res.stderr or "").strip())
-            out = "\n".join(l for l in logs if l) or "导出完成"
-            self._log("手动导出 完成：" + out)
-            self.after(0, lambda out=out: self.status.config(text=out))
-            self.after(0, lambda: self.progress.config(value=total if total else 1))
-        except Exception as e:
-            self._log("手动导出 失败：" + str(e))
-            self.after(0, lambda e=e: self.status.config(text="导出失败：" + str(e)))
-        finally:
-            self.after(0, lambda: self.btn_export.config(state="normal"))
 
 
 class DeviceListDialog(tk.Toplevel):
@@ -2506,7 +1722,7 @@ class DeviceListDialog(tk.Toplevel):
         ttk.Button(af, text="确定", command=self._on_ok).pack(side="right", padx=4)
         ttk.Button(af, text="取消", command=self.destroy).pack(side="right", padx=4)
 
-        self.status = ttk.Label(self, text="", foreground="#1a73e8", wraplength=440)
+        self.status = ttk.Label(self, text="", foreground=ui_common.COLOR_INFO, wraplength=440)
         self.status.pack(anchor="w", padx=10, pady=(2, 6))
 
     def _sniff(self):
@@ -2555,6 +1771,625 @@ class DeviceListDialog(tk.Toplevel):
         self.after(700, self.destroy)
 
 
+class TaskCenterDialog(tk.Toplevel):
+    """任务中心：把「重新计算指标 / 补算缺失指标 / CSV 导出（手动+自动）」三个操作
+    整合为一个多标签二级界面。公共区域复用产线/设备/月份筛选逻辑；
+    每个标签页放各自专属参数与操作按钮，底部共用进度条与状态区。"""
+
+    def __init__(self, parent, conn, db_lock, app):
+        super().__init__(parent)
+        self.withdraw()   # 先隐藏，避免默认位置闪现后再跳到居中
+        self.conn = conn
+        self.db_lock = db_lock
+        self.app = app
+        self._alive = True
+        self._last_wrap_w = 0
+        self._stop_event = threading.Event()
+        self._running = False
+        self.export_outdir_var = tk.StringVar()
+        self.entry_export_outdir = None
+        self.export_col_vars = {}
+        # 自动导出（UI 在本页；运行线程挂在主程序 app 上，关闭本窗口不影响已启动的定时导出）
+        self._auto_toggling = False
+        self.auto_enabled_var = tk.BooleanVar(
+            value=bool(self.app.state.get("csv_auto_enabled", False)))
+        self.auto_interval_var = tk.StringVar(
+            value=str(self.app.state.get("csv_auto_interval_min", 60)))
+        self.auto_path_var = tk.StringVar(
+            value=self.app.state.get("csv_auto_outdir", ""))
+        self.chk_auto = None            # 以下控件在 _build_csv_tab 中创建
+        self.entry_auto_interval = None
+        self.entry_auto_path = None
+        # 导出列折叠控件
+        self._export_cols_expanded = tk.BooleanVar(value=False)
+        self.btn_toggle_cols = None
+        self.export_cols_frame = None
+        self.title("任务中心")
+        self.geometry("900x860")
+        self.resizable(True, True)
+        # 居中于主窗口
+        self.update_idletasks()
+        self.geometry("+%d+%d" % (
+            parent.winfo_rootx() + max(0, (parent.winfo_width() - self.winfo_width()) // 2),
+            parent.winfo_rooty() + max(0, (parent.winfo_height() - self.winfo_height()) // 2)))
+        try:
+            _st = ttk.Style()
+            _st.configure("Small.TButton", font=("Microsoft YaHei", 9), padding=(2, 2))
+        except Exception:
+            pass
+        self._build()
+        self._load_devices()
+        self._load_months()
+        self.deiconify()   # 定位完毕后再显示，消除闪烁
+        self.lift()
+
+    def destroy(self):
+        self._alive = False
+        super().destroy()
+
+    def _build(self):
+        # 底部固定区：操作按钮 + 选择提示/状态/进度（side=bottom 先占位，始终可见）
+        frm_bottom = ttk.Frame(self)
+        frm_bottom.pack(side="bottom", fill="x", padx=10, pady=(4, 6))
+
+        # 顶部公共筛选区：产线 + 设备 + 月份（各标签页共用，共享组件与查看器同源）
+        frm_filter = ttk.LabelFrame(self, text="筛选（产线 / 设备 / 月份，各标签页共用）",
+                                    padding=(8, 4))
+        frm_filter.pack(side="top", fill="x", padx=10, pady=(8, 4))
+
+        # 当前选择摘要（由组件显示在产线行右侧）
+        self.sel_var = tk.StringVar(value="")
+        self.filter = ui_common.LineDeviceMonthFilter(
+            frm_filter, on_change=self._update_sel_label, status_var=self.sel_var)
+        self.filter.pack(fill="x")
+
+        # Notebook：三个任务标签页（重新计算指标 / 补算缺失指标 / 手动导出）。
+        # 各标签内容不多，故不撑满剩余空间（expand=False），高度由内容决定；
+        # 把纵向空间让给下方「操作日志」区。
+        _st = ttk.Style()
+        try:
+            # 标签默认常规字体；选中的标签加粗 + 变色，未选中的恢复默认
+            _st.configure("Task.TNotebook.Tab", font=("Microsoft YaHei", 9))
+            _st.map("Task.TNotebook.Tab",
+                    font=[("selected", ("Microsoft YaHei", 9, "bold"))],
+                    foreground=[("selected", ui_common.COLOR_INFO), ("!selected", "#333333")])
+        except Exception:
+            pass
+        self.nb = ttk.Notebook(self, style="Task.TNotebook")
+        self.nb.pack(side="top", fill="x", padx=10, pady=(4, 2))
+        self._build_recalc_tab()
+        self._build_compute_new_tab()
+        self._build_csv_tab()
+
+        # 任务中心日志区：所有标签页的操作日志都显示在此，不再写入主界面。
+        # 它是主要纵向空间（expand=True），高度拉高，保证操作日志清晰可见。
+        log_frame = ttk.LabelFrame(self, text="操作日志", padding=(6, 2))
+        log_frame.pack(side="top", fill="both", expand=True, padx=10, pady=(2, 4))
+        self.log_text = tk.Text(log_frame, height=14, wrap="none", state="disabled",
+                                borderwidth=0, relief="flat",
+                                font=("Microsoft YaHei", 8))
+        self.log_sb = ttk.Scrollbar(log_frame, orient="vertical",
+                                    command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=self.log_sb.set)
+        self.log_text.pack(side="left", fill="both", expand=True, padx=(2, 4), pady=4)
+        self.log_sb.pack(side="right", fill="y")
+
+        # 进度条 + 状态区
+        self.prog = ttk.Progressbar(frm_bottom, orient="horizontal",
+                                    mode="determinate", maximum=100)
+        self.prog.pack(fill="x", pady=(2, 0))
+        status_holder = ttk.Frame(frm_bottom, height=24)
+        status_holder.pack(fill="x", padx=10, pady=2)
+        status_holder.pack_propagate(False)
+        self.status = ttk.Label(status_holder, text="", foreground=ui_common.COLOR_INFO,
+                                anchor="nw", justify="left")
+        self.status.pack(fill="both", expand=True)
+        self.bind("<Configure>", self._on_configure)
+        self._on_configure()
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+    def _build_recalc_tab(self):
+        tab = ttk.Frame(self.nb, padding=10)
+        self.nb.add(tab, text="♻ 重新计算指标")
+        ttk.Label(tab, text="按上方筛选的「月份 / 设备」范围重算指标。",
+                  foreground="#666").pack(anchor="w", pady=(0, 8))
+        btns = ttk.Frame(tab)
+        btns.pack(anchor="w", pady=(8, 0))
+        ttk.Button(btns, text="开始重算",
+                   command=self._run_recalc).pack(side="left", padx=(0, 6))
+        ttk.Button(btns, text="取消",
+                   command=self._stop_recalc).pack(side="left")
+
+    def _stop_recalc(self):
+        if self._running:
+            self._stop_event.set()
+            try:
+                self.status.config(text="正在取消…")
+            except tk.TclError:
+                pass
+
+    def _build_compute_new_tab(self):
+        tab = ttk.Frame(self.nb, padding=10)
+        self.nb.add(tab, text="➕ 补算缺失指标")
+        ttk.Label(tab, text="按上方筛选的「月份 / 设备」范围，仅补齐缺失指标的文件。",
+                  foreground="#666").pack(anchor="w", pady=(0, 8))
+        btns = ttk.Frame(tab)
+        btns.pack(anchor="w", pady=(8, 0))
+        ttk.Button(btns, text="开始补算",
+                   command=self._run_compute_new).pack(side="left", padx=(0, 6))
+        ttk.Button(btns, text="取消",
+                   command=self._stop_recalc).pack(side="left")
+
+    def _build_csv_tab(self):
+        tab = ttk.Frame(self.nb, padding=10)
+        self.nb.add(tab, text="⇩ CSV 导出")
+
+        # ===== 手动导出（按筛选，一次性） =====
+        man = ttk.LabelFrame(tab, text="手动导出（按上方筛选，一次性）", padding=(6, 4))
+        man.pack(fill="x")
+        ttk.Label(man, text="按上方筛选的「月份 / 设备」范围导出 CSV，目录在开始导出时选择。",
+                  foreground="#666").pack(anchor="w", pady=(0, 8))
+        # 导出目录在「开始导出」时弹出选择（见 _run_export）
+
+        # 导出列：内容较多，做成可折叠按钮 —— 平时收起（仅一个按钮），点击展开列勾选区
+        col_toggle_row = ttk.Frame(man)
+        col_toggle_row.pack(fill="x", pady=(8, 0))
+        self._export_cols_expanded = tk.BooleanVar(value=False)
+        self.btn_toggle_cols = ttk.Button(col_toggle_row, text="▶ 展开导出列",
+                                          command=self._toggle_export_cols)
+        self.btn_toggle_cols.pack(side="left")
+        ttk.Label(col_toggle_row, text="（列与自动导出共用一份配置）",
+                  foreground="#888").pack(side="left", padx=(6, 0))
+
+        # 列勾选区（默认收起，由 _toggle_export_cols 控制显示/隐藏）
+        self.export_cols_frame = ttk.Frame(man)
+        cf = ttk.LabelFrame(self.export_cols_frame, text="导出列（可复选）")
+        cf.pack(fill="x", pady=(6, 4))
+        _cols = [label for label, _ in export_csv.ALL_COLUMNS]
+        _saved = self.app.state.get("csv_cols") or []
+        _ncol = 4
+        _export_rows = max(1, (len(_cols) + _ncol - 1) // _ncol)
+        box_h = min(max(90, _export_rows * 22 + 8), 220)
+        canv_frame = ttk.Frame(cf, borderwidth=1, relief="solid")
+        canv_frame.pack(fill="x", padx=6, pady=4)
+        _canv = tk.Canvas(canv_frame, highlightthickness=0, height=box_h)
+        _sb = ttk.Scrollbar(canv_frame, orient="vertical", command=_canv.yview)
+        _inner = ttk.Frame(_canv)
+        _inner.bind("<Configure>",
+                    lambda e: _canv.configure(scrollregion=_canv.bbox("all")))
+        _win = _canv.create_window((0, 0), window=_inner, anchor="nw")
+        _canv.bind("<Configure>", lambda e: _canv.itemconfigure(_win, width=e.width))
+        _canv.configure(yscrollcommand=_sb.set)
+        _canv.pack(side="left", fill="both", expand=True)
+        _sb.pack(side="right", fill="y")
+        _canv.bind("<MouseWheel>",
+                   lambda e: _canv.yview_scroll(int(-e.delta / 120), "units"))
+        self.export_col_vars = {}
+        _exp_widgets = []
+        for _label in _cols:
+            # 有保存的选择则按保存勾选，否则全部未选
+            _v = tk.BooleanVar(value=_label in _saved)
+            self.export_col_vars[_label] = _v
+            _exp_widgets.append(ttk.Checkbutton(_inner, text=_label, variable=_v))
+        _COL_W = 150
+        def _relayout():
+            _w = _canv.winfo_width()
+            _n = max(1, _w // (_COL_W + 10))
+            for _i, _wd in enumerate(_exp_widgets):
+                _wd.grid(row=_i // _n, column=_i % _n, sticky="w", padx=4, pady=1)
+            _canv.configure(scrollregion=_canv.bbox("all"))
+        _canv.bind("<Configure>", lambda e: _relayout())
+        # 导出列全选/清空
+        bf_cols = ttk.Frame(self.export_cols_frame)
+        bf_cols.pack(fill="x", pady=(2, 6))
+        ttk.Button(bf_cols, text="全选列", style="Small.TButton",
+                   command=self._set_export_cols_all).pack(side="left", padx=2)
+        ttk.Button(bf_cols, text="清列", style="Small.TButton",
+                   command=self._set_export_cols_none).pack(side="left", padx=2)
+        # 收起状态：初始不显示列勾选区
+        self.export_cols_frame.pack(fill="x")
+        self.export_cols_frame.pack_forget()
+        # 手动导出按钮：开始 / 取消
+        btns = ttk.Frame(man)
+        btns.pack(anchor="w", pady=(8, 0))
+        ttk.Button(btns, text="开始导出",
+                   command=self._run_export).pack(side="left", padx=(0, 6))
+        ttk.Button(btns, text="取消",
+                   command=self._stop_recalc).pack(side="left")
+
+        # ===== 自动导出（定时增量；运行线程在主程序，关闭本窗口不停止） =====
+        auto = ttk.LabelFrame(
+            tab, text="自动导出（定时增量：只重写最近两个月有新增的月份）", padding=(6, 4))
+        auto.pack(fill="x", pady=(10, 0))
+
+        row1 = ttk.Frame(auto)
+        row1.pack(fill="x", pady=(2, 2))
+        # 启用自动导出只通过 trace 触发一次（避免 command + trace 双重调用）；
+        # 回滚 auto_enabled_var.set(False) 也会被 trace 捕获，路径统一。
+        self.chk_auto = ttk.Checkbutton(row1, text="启用自动导出（勾选即开始 / 取消即停止）",
+                                        variable=self.auto_enabled_var)
+        self.chk_auto.pack(side="left")
+        ttk.Label(row1, text="间隔：").pack(side="right", padx=(10, 2))
+        self.entry_auto_interval = ttk.Entry(row1, textvariable=self.auto_interval_var, width=7)
+        self.entry_auto_interval.pack(side="right", padx=(2, 0))
+        ttk.Label(row1, text="分").pack(side="right", padx=(0, 2))
+        self.auto_interval_var.trace_add(
+            "write", lambda *a: self._save_auto_state())
+        self.auto_enabled_var.trace_add(
+            "write", lambda *a: self._on_auto_enabled_toggle())
+
+        row2 = ttk.Frame(auto)
+        row2.pack(fill="x", pady=(2, 2))
+        row2.columnconfigure(1, weight=1)
+        ttk.Label(row2, text="导出目录：").grid(row=0, column=0, sticky="w")
+        self.entry_auto_path = ttk.Entry(row2, textvariable=self.auto_path_var)
+        self.entry_auto_path.grid(row=0, column=1, sticky="ew", padx=(4, 4))
+        ttk.Button(row2, text="浏览...", command=self._browse_auto_path).grid(
+            row=0, column=2, sticky="e")
+        ttk.Button(row2, text="全量导出一次",
+                   command=lambda: self.app._auto_export_once(log=True, manual=True)).grid(
+            row=0, column=3, sticky="w", padx=(6, 0))
+        ttk.Button(row2, text="打开目录",
+                   command=self._open_auto_path).grid(row=0, column=4, sticky="w", padx=(6, 0))
+
+        ttk.Label(auto, text="「全量导出一次」立即导出库中所有月份（带 --all）；"
+                             "定时导出只增量更新最近两个月，历史月文件原样保留。",
+                  foreground="#888").pack(anchor="w", pady=(2, 0))
+
+    # ---------- 筛选联动 ----------
+    def _load_devices(self):
+        try:
+            rows = [r[0] for r in self.conn.execute(
+                "SELECT DISTINCT device FROM processed "
+                "WHERE device IS NOT NULL AND device <> '' ORDER BY device")]
+        except Exception:
+            rows = []
+        self.filter.set_devices(rows)
+        self.filter.apply_line()
+
+    def _load_months(self):
+        try:
+            rows = [r[0] for r in self.conn.execute(
+                "SELECT DISTINCT ym FROM processed "
+                "WHERE ym IS NOT NULL AND ym <> '' ORDER BY ym")]
+        except Exception:
+            rows = []
+        self.filter.set_months(rows)
+        # 月份默认全部不选；留空 = 不按月份过滤（等价全部），不预选
+        self._update_sel_label()
+
+    def _update_sel_label(self):
+        if not getattr(self, "_alive", True):
+            return
+        line = "/".join(self.filter.selected_lines()) or "（不限）"
+        ndev = len(self.filter.selected_devices())
+        ndev_total = len(self.filter.device_items())
+        nym = len(self.filter.selected_months())
+        nym_total = self.filter.mth_listbox.size()
+        dev_txt = "未选" if ndev == 0 else "%d/%d" % (ndev, ndev_total)
+        ym_txt = "未选" if nym == 0 else "%d/%d" % (nym, nym_total)
+        self.sel_var.set("当前选择 → 产线: %s | 设备: %s | 月份: %s"
+                         % (line, dev_txt, ym_txt))
+
+    def _on_configure(self, event=None):
+        w = self.winfo_width() - 20
+        if w < 60:
+            w = 60
+        if getattr(self, "_last_wrap_w", None) == w:
+            return
+        self._last_wrap_w = w
+        try:
+            self.status.configure(wraplength=w)
+        except tk.TclError:
+            pass
+
+    # ---------- 当前筛选结果 ----------
+    def _selected(self):
+        ym = self.filter.selected_months()
+        dev = self.filter.selected_devices()
+        lines = self.filter.selected_lines()
+        return ym, dev, lines
+
+    def _enter_run(self):
+        self._stop_event.clear()
+        self.status.config(text="处理中…")
+        self.prog.configure(value=0)
+        self.filter.mth_listbox.configure(state="disabled")
+        self.filter.dev_listbox.configure(state="disabled")
+        self._running = True
+
+    def _exit_run(self, msg):
+        self.status.config(text=msg)
+        self.filter.mth_listbox.configure(state="normal")
+        self.filter.dev_listbox.configure(state="normal")
+        self._running = False
+
+    def _cancel(self):
+        if getattr(self, "_stop_event", None) is None or not getattr(self, "_running", False):
+            self.destroy()
+            return
+        self._stop_event.set()
+        try:
+            self.status.config(text="正在取消（请稍候）…")
+        except tk.TclError:
+            pass
+
+    def _progress_cb(self):
+        prog = self.prog
+        def _cb(done, total):
+            if total > 0:
+                pct = int(done * 100 / total)
+                self.after(0, lambda: prog.configure(value=pct))
+        return _cb
+
+    # ---------- 重新计算指标 ----------
+    def _require_filter(self):
+        """重算/补算/导出前检查：设备、月份都必须选择（留空=一个都没选，不允许）。
+        任一缺失则提示用户，返回 False；否则返回 True。"""
+        ym, dev, _lines = self._selected()
+        if not dev:
+            messagebox.showwarning(
+                "未选择设备",
+                "请先勾选要处理的设备。",
+                parent=self)
+            return False
+        if not ym:
+            messagebox.showwarning(
+                "未选择月份",
+                "请先勾选要处理的月份。",
+                parent=self)
+            return False
+        return True
+
+    def _run_recalc(self):
+        if not self._require_filter():
+            return
+        if self.app.thread and self.app.thread.is_alive():
+            messagebox.showwarning("扫描进行中",
+                                   "请先停止扫描，再重新计算指标。", parent=self)
+            return
+        ym, dev, _lines = self._selected()
+        if self._running:
+            return
+        self._log("重新计算指标开始 → 月份 %s，设备 %s"
+                  % (ym or "全部", "、".join(dev) if dev else "全部"))
+        self._enter_run()
+        threading.Thread(target=self._recalc_worker,
+                         args=(ym, dev, False), daemon=True).start()
+
+    # ---------- 补算缺失指标 ----------
+    def _run_compute_new(self):
+        if not self._require_filter():
+            return
+        if self.app.thread and self.app.thread.is_alive():
+            messagebox.showwarning("扫描进行中",
+                                   "请先停止扫描，再补算缺失指标。", parent=self)
+            return
+        ym, dev, _lines = self._selected()
+        if self._running:
+            return
+        self._log("补算缺失指标开始 → 月份 %s，设备 %s"
+                  % (ym or "全部", "、".join(dev) if dev else "全部"))
+        self._enter_run()
+        threading.Thread(target=self._recalc_worker,
+                         args=(ym, dev, True), daemon=True).start()
+
+    def _recalc_worker(self, ym_sel, dev_sel, missing_only):
+        self.after(0, lambda: self.prog.configure(value=0))
+        try:
+            if missing_only:
+                n = analysis.recalc_missing(self.conn, self.db_lock, ym_sel, dev_sel,
+                                            on_progress=self._progress_cb(),
+                                            stop_event=self._stop_event,
+                                            use_process=self.app._use_process() if self.app else False)
+            else:
+                n = analysis.recalc_by_months(self.conn, self.db_lock, ym_sel, dev_sel,
+                                              on_progress=self._progress_cb(),
+                                              stop_event=self._stop_event,
+                                              workers=self.app._get_compute_workers() if self.app else None,
+                                              use_process=self.app._use_process() if self.app else False)
+            msg = "已%s %d 个文件" % ("补齐" if missing_only else "重算", n)
+        except Exception as e:
+            n = 0
+            msg = "出错：" + str(e)
+        if self._stop_event.is_set() and "出错" not in msg:
+            msg = "已取消（已处理 %d 个）" % n
+        self.after(0, lambda: self._finish_recalc(msg))
+
+    def _finish_recalc(self, msg):
+        self._exit_run(msg)
+        self._log(msg)
+        if self.app:
+            try:
+                self.app._refresh_from_state()
+            except Exception:
+                pass
+
+    # ---------- 手动导出 ----------
+    def _set_export_cols_all(self):
+        for v in self.export_col_vars.values():
+            v.set(True)
+        self._save_export_cols()
+
+    def _set_export_cols_none(self):
+        for v in self.export_col_vars.values():
+            v.set(False)
+        self._save_export_cols()
+
+    def _toggle_export_cols(self):
+        """展开 / 收起 CSV 导出页的列勾选区。"""
+        if self.export_cols_frame is None or self.btn_toggle_cols is None:
+            return
+        if self._export_cols_expanded.get():
+            self.export_cols_frame.pack_forget()
+            self.btn_toggle_cols.config(text="▶ 展开导出列")
+            self._export_cols_expanded.set(False)
+        else:
+            self.export_cols_frame.pack(fill="x")
+            self.btn_toggle_cols.config(text="▼ 收起导出列")
+            self._export_cols_expanded.set(True)
+
+    def _save_export_cols(self):
+        """导出列（与自动导出共用一份 csv_cols）持久化。"""
+        cols = [lbl for lbl, v in self.export_col_vars.items() if v.get()]
+        self.app.state["csv_cols"] = cols
+        self.app._save_config()
+
+    # ---------- 自动导出（定时增量；运行线程挂在主程序 app 上） ----------
+    def _save_auto_state(self):
+        """把自动导出 UI 值写入 state 并持久化；间隔非法时跳过本次保存（不弹窗）。"""
+        try:
+            interval = int(self.auto_interval_var.get().strip())
+        except ValueError:
+            return False
+        if interval <= 0:
+            return False
+        self.app.state["csv_auto_enabled"] = bool(self.auto_enabled_var.get())
+        self.app.state["csv_auto_interval_min"] = interval
+        self.app.state["csv_auto_outdir"] = self.auto_path_var.get().strip()
+        self.app._save_config()
+        return True
+
+    def _on_auto_enabled_toggle(self):
+        """勾选「启用自动导出」即立即开始定时导出；取消勾选即停止并持久化偏好。"""
+        if getattr(self, "_auto_toggling", False):
+            return
+        self._auto_toggling = True
+        try:
+            self._save_auto_state()
+            if self.auto_enabled_var.get():
+                ok = self.app.start_auto_export(silent=False)
+                if not ok:
+                    # 启动失败（如未设目录/间隔非法）则回滚勾选并持久化
+                    self.auto_enabled_var.set(False)
+                    self._save_auto_state()
+            else:
+                self.app.stop_auto_export()
+        finally:
+            self._auto_toggling = False
+
+    def _browse_auto_path(self):
+        d = filedialog.askdirectory(parent=self,
+                                    initialdir=self.auto_path_var.get() or os.path.expanduser("~"))
+        if d:
+            self.auto_path_var.set(d)
+            self._save_auto_state()
+
+    def _open_auto_path(self):
+        """在系统文件管理器中打开自动导出目录（不存在则先创建）。"""
+        d = self.auto_path_var.get().strip()
+        if not d:
+            messagebox.showinfo("导出目录", "请先设置自动导出目录。", parent=self)
+            return
+        if not os.path.isdir(d):
+            try:
+                os.makedirs(d, exist_ok=True)
+            except Exception as e:
+                messagebox.showerror("导出目录", "目录不存在且无法创建：%s" % e, parent=self)
+                return
+        try:
+            os.startfile(d)  # Windows：用默认文件管理器打开
+        except Exception as e:
+            messagebox.showerror("导出目录", "无法打开目录：%s" % e, parent=self)
+
+    def _run_export(self):
+        if not self._require_filter():
+            return
+        # 弹出选择导出目录
+        outdir = filedialog.askdirectory(
+            parent=self,
+            initialdir=self.app.state.get("csv_manual_outdir") or os.path.expanduser("~"))
+        if not outdir:
+            return
+        self.export_outdir_var.set(outdir)
+        cols = [lbl for lbl, v in self.export_col_vars.items() if v.get()]
+        if not cols:
+            messagebox.showwarning("列未选", "请至少选择一列导出。", parent=self)
+            return
+        if self._running:
+            return
+        ym, dev, lines = self._selected()
+        dev_set = set(dev)
+        # 产线联动：把产线下所有设备也纳入
+        if lines:
+            for d in self.filter.device_items():
+                if analysis.classify_line(d) in lines:
+                    dev_set.add(d)
+        months = ym
+        if not months:
+            try:
+                months = [r[0] for r in self.conn.execute(
+                    "SELECT DISTINCT ym FROM processed "
+                    "WHERE ym IS NOT NULL AND ym <> '' ORDER BY ym")]
+            except Exception:
+                months = []
+        self.app.state["csv_manual_outdir"] = outdir
+        self.app.state["csv_cols"] = cols
+        self.app._save_config()
+        self._enter_run()
+        threading.Thread(target=self._export_worker,
+                         args=(outdir, sorted(dev_set), months, cols),
+                         daemon=True).start()
+
+    def _export_worker(self, outdir, devices, months, cols):
+        import subprocess
+        script = os.path.join(_HERE, "export_csv.py")
+        total = len(months)
+        self._log("手动导出开始 → 目录=%s | 设备=%s | 列=%d个 | 月份=%d个"
+                  % (outdir, "、".join(devices) if devices else "全部", len(cols), total))
+        try:
+            if not months:
+                self.after(0, lambda: self.status.config(text="没有可导出的月份（数据库为空）。"))
+            self.after(0, lambda: self.prog.configure(maximum=max(1, total)))
+            idx = 0
+            for idx, m in enumerate(months, 1):
+                if self._stop_event.is_set():
+                    break
+                cmd = [sys.executable, script, "--outdir", outdir, "--ym", m, "--cols"] + cols
+                if devices:
+                    cmd += ["--device"] + devices
+                self._log("手动导出 正在导出 %s … (%d/%d)" % (m, idx, total))
+                self.after(0, lambda idx=idx, total=total, m=m: (
+                    self.status.config(text="正在导出 %s … (%d/%d)" % (m, idx, total)),
+                    self.prog.config(value=idx)))
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+            msg = "导出完成：%d 个月" % (len(months) if not self._stop_event.is_set() else idx)
+            if self._stop_event.is_set():
+                msg = "已取消（已处理 %d 个月）" % idx
+            self._log("手动导出 " + msg)
+            self.after(0, lambda: self._exit_run(msg))
+        except Exception as e:
+            self._log("手动导出 失败：" + str(e))
+            self.after(0, lambda e=e: self._exit_run("导出失败：" + str(e)))
+
+    def _log(self, msg):
+        """把操作日志写入任务中心窗口的日志区（不写入主界面）。可在工作线程调用。"""
+        if not getattr(self, "_alive", False) or not hasattr(self, "log_text"):
+            return
+        try:
+            text = ("[%s] %s\n" % (time.strftime("%H:%M:%S"), msg))
+            self.after(0, lambda t=text: self._append_log_text(t))
+        except Exception:
+            pass
+
+    def _append_log_text(self, text):
+        try:
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", text)
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+        except tk.TclError:
+            pass
+
+    def _clear_log(self):
+        try:
+            self.log_text.configure(state="normal")
+            self.log_text.delete("1.0", "end")
+            self.log_text.configure(state="disabled")
+        except tk.TclError:
+            pass
+
+
 def _dpi_scale():
     """返回系统 DPI 缩放系数（dpi/96）。
 
@@ -2599,9 +2434,15 @@ def main():
     _enable_high_dpi()  # 必须在 tk.Tk() 之前，否则窗口已建无法再声明 DPI 感知
     root = tk.Tk()
     app = ScannerApp(root)
+    app._refresh_poll_state()  # 启动时不扫描，扫描「间隔（秒）」默认可改
     root.protocol("WM_DELETE_WINDOW",
                   lambda: (app.stop_auto_export(), app._save_config(), root.destroy()))
     root.mainloop()
+    # 退出时关闭全局进程池（若有），避免残留子进程
+    try:
+        analysis._shutdown_proc_pool()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

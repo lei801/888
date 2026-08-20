@@ -22,9 +22,52 @@ import json
 import functools
 import sqlite3
 import datetime
+import time
 import threading
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from contextlib import contextmanager
+
+# 全局惰性进程池：仅在需要多进程并行时创建一次并常驻复用，避免每批反复 spawn 子进程
+# （Windows 下 spawn 一次要重新 import 本模块，开销大）。子进程 import 本模块时该值保持
+# None，不会触发递归创建；由主进程首次并行调用时才真正创建。
+# 释放策略：重算/补算这类一次性任务跑完后，由 recalc_by_months / recalc_missing 在 finally
+# 中显式调用 _shutdown_proc_pool() 立即关闭、归还子进程内存；下次再算时惰性重建。
+_proc_pool = None
+_proc_pool_workers = 0
+_pool_lock = threading.Lock()
+
+
+def _get_proc_pool(workers):
+    """返回全局进程池（惰性创建、常驻复用）。"""
+    global _proc_pool, _proc_pool_workers
+    if workers is None or workers < 1:
+        workers = 1
+    with _pool_lock:
+        if _proc_pool is not None:
+            if _proc_pool_workers != workers:
+                # 用户改了并行数：重建池（很少发生，重建一次可接受）
+                _proc_pool.shutdown(wait=True, cancel_futures=True)
+                _proc_pool = ProcessPoolExecutor(max_workers=workers)
+                _proc_pool_workers = workers
+            return _proc_pool
+        _proc_pool = ProcessPoolExecutor(max_workers=workers)
+        _proc_pool_workers = workers
+        return _proc_pool
+
+
+def _shutdown_proc_pool(wait=True):
+    """关闭全局进程池并释放子进程内存（进程退出或重算/补算结束后调用）。
+
+    wait=True（默认）：等子进程全部退出后再返回，确保占用的内存真正归还操作系统。
+    在进程池确实空闲时调用才安全（不阻塞）；若仍有在飞任务，wait=True 会等它们跑完。
+    调用后 _get_proc_pool 会再次惰性重建，因此「用完即关、用时再建」可反复进行。
+    """
+    global _proc_pool, _proc_pool_workers
+    with _pool_lock:
+        if _proc_pool is not None:
+            _proc_pool.shutdown(wait=wait, cancel_futures=True)
+            _proc_pool = None
+            _proc_pool_workers = 0
 
 
 @contextmanager
@@ -99,7 +142,7 @@ def _parse_csv(path):
     return rows, delim, enc
 
 
-@functools.lru_cache(maxsize=256)
+@functools.lru_cache(maxsize=64)
 def _parse_csv_cached(path):
     return _parse_csv(path)
 
@@ -194,7 +237,7 @@ def _empty_stats():
     st = {
         "lot": "", "block": "", "fdate": "",
         "hinmei_fmt": "",
-        "is_mass": "", "total": 0, "outer_total": 0,
+        "is_mass": 0, "total": 0, "outer_total": 0,
         "inner_sum": 0, "outer_sum": 0, "inner_odd": 0,
         "std_inner": None, "std_outer": None,
     }
@@ -285,7 +328,7 @@ def _file_stats(path):
     st["inner_odd"] = odd
     st["std_inner"] = _stdev(z_vals)
     st["std_outer"] = _stdev(ab_vals)
-    st["is_mass"] = "非量产" if not is_mass else "量产"
+    st["is_mass"] = 1 if is_mass else 0   # 是否量产：1=量产，0=非量产
     return st
 
 
@@ -327,10 +370,10 @@ METRICS["fdate"] = {
     "label": "日期", "type": "TEXT", "column": "fdate",
     "compute": _make_stat_getter("fdate", ""),
 }
-# 是否量产：以 "__.csv" 结尾判定为非量产，其余为量产
+# 是否量产：以 "__.csv" 结尾判定为非量产，其余为量产；存 1=量产，0=非量产
 METRICS["is_mass"] = {
-    "label": "是否量产", "type": "TEXT", "column": "is_mass",
-    "compute": _make_stat_getter("is_mass", ""),
+    "label": "是否量产", "type": "INTEGER", "column": "is_mass",
+    "compute": _make_stat_getter("is_mass", 0),
 }
 # 总枚数（PQ 口径：末个有效行的 L 值）
 METRICS["total_max"] = {
@@ -414,53 +457,60 @@ def compute_all(path):
     return out
 
 
-def compute_paths(paths, workers=1, stop_event=None):
+def compute_paths(paths, workers=1, stop_event=None, use_process=False):
     """生成器：对 paths 逐个 compute_all，按完成顺序产出 (path, results)。
 
-    - workers 为 None 或 <=1（或文件数<=1）时退化为串行，与旧实现行为一致；
-    - workers>1 时用线程池并行计算（读网络盘 I/O 等待为主，多线程有实际收益）；
-    - stop_event 置位时停止派发新任务，已在飞行的任务结果直接丢弃；
+    已移除多线程（ThreadPoolExecutor）路径，只保留两种模式：
+    - use_process=False（默认）或 workers<=1：退化为串行（单文件逐个算）；
+    - use_process=True 且 workers>1：用多进程池并行计算（绕开 GIL，CPU 密集的历史回填/
+      重算可真正并行多核，速度明显提升）。进程池为全局惰性常驻，重算/补算结束后由
+      recalc_by_months / recalc_missing 在 finally 中显式关闭（_shutdown_proc_pool）释放内存。
+    - stop_event 置位时停止派发新任务/停止取后续结果（进程池模式下单个在飞子进程任务
+      会跑完才返回，结果由主进程丢弃；子进程内不检查该事件，因 threading.Event 不可 pickle）；
     - 调用方负责把产出的结果批量落库（SQLite 写库必须单线程串行）。
     """
     total = len(paths)
     if workers is None:
         workers = 1
-    if workers <= 1 or total <= 1:
+    if not use_process or workers <= 1 or total <= 1:
+        # 串行路径：单文件逐个算，不经线程/进程池（内存最省、无额外进程）
         for p in paths:
             if stop_event is not None and stop_event.is_set():
                 break
             yield p, compute_all(p)
         return
+    # 多进程路径：窗口式派发到全局进程池。ProcessPoolExecutor 无 imap（那是
+    # multiprocessing.Pool 的），用 submit + wait 保持最多 workers*2 个在飞任务，
+    # 避免一次性为 360 万文件建海量 Future。compute_all 返回的 dict 不含 path，
+    # 用 {future: path} 映射按结果回配。子进程内不检查 stop_event（不可 pickle），
+    # 主进程侧检查决定是否继续取/派发。
+    pool = _get_proc_pool(workers)
     it = iter(paths)
     futs = {}
-    ex = ThreadPoolExecutor(max_workers=workers)
-    try:
-        def _fill():
-            # 窗口式派发：最多保持 workers*2 个在飞任务，避免一次性为大列表建海量 Future
-            while len(futs) < workers * 2:
-                if stop_event is not None and stop_event.is_set():
-                    return
-                try:
-                    p = next(it)
-                except StopIteration:
-                    return
-                futs[ex.submit(compute_all, p)] = p
-        _fill()
-        while futs:
+
+    def _fill_proc():
+        while len(futs) < workers * 2:
             if stop_event is not None and stop_event.is_set():
-                break
-            done_set, _ = wait(futs, return_when=FIRST_COMPLETED)
-            for fut in done_set:
-                p = futs.pop(fut)
-                try:
-                    res = fut.result()
-                except Exception:
-                    res = {k: None for k in METRICS}
-                yield p, res
-            _fill()
-    finally:
-        # 取消/正常结束：撤销未开始的任务；在飞任务跑完后线程自然退出（结果不再使用）
-        ex.shutdown(wait=False, cancel_futures=True)
+                return
+            try:
+                p = next(it)
+            except StopIteration:
+                return
+            futs[pool.submit(compute_all, p)] = p
+
+    _fill_proc()
+    while futs:
+        if stop_event is not None and stop_event.is_set():
+            break
+        done_set, _ = wait(futs, return_when=FIRST_COMPLETED)
+        for fut in done_set:
+            p = futs.pop(fut)
+            try:
+                res = fut.result()
+            except Exception:
+                res = {k: None for k in METRICS}
+            yield p, res
+        _fill_proc()
 
 
 def _upsert_rows(conn, path, results, run_at):
@@ -513,7 +563,7 @@ def upsert_batch(conn, lock, items, run_at=None):
 
 
 def recalc_by_months(conn, lock, ym_list, dev_list=None, on_progress=None, stop_event=None,
-                     workers=None):
+                     workers=None, use_process=False):
     """按月份（可选）和/或设备（可选）重算（局部重算）。
 
     - ym_list 为空/None  => 不限月份
@@ -524,47 +574,52 @@ def recalc_by_months(conn, lock, ym_list, dev_list=None, on_progress=None, stop_
     仅加一次锁，循环内调用 _upsert_rows 不再重复加锁，避免与扫描线程死锁。
     """
     cm = lock if lock is not None else _nullcontext()
-    with cm:
-        conds, params = [], []
-        if ym_list:
-            ph = ",".join("?" * len(ym_list))
-            conds.append(f"ym IN ({ph})")
-            params.extend(ym_list)
-        if dev_list:
-            ph = ",".join("?" * len(dev_list))
-            conds.append(f"device IN ({ph})")
-            params.extend(dev_list)
-        where = ("WHERE " + " AND ".join(conds)) if conds else ""
-        paths = [
-            r[0]
-            for r in conn.execute(f"SELECT path FROM processed {where}", params)
-        ]
-        run_at = _now()
-        # 批量提交：每 1000 个文件一次性落库，减少事务提交开销
-        _BATCH = 1000
-        total = len(paths)
-        step = max(1, total // 100)
-        buf = []
-        done = 0
-        for p, res in compute_paths(paths, workers, stop_event):
-            if stop_event is not None and stop_event.is_set():
-                break  # 用户取消：停止取后续结果，已算出的 buf 照常落库
-            buf.append((p, res))
-            done += 1
-            if len(buf) >= _BATCH:
+    try:
+        with cm:
+            conds, params = [], []
+            if ym_list:
+                ph = ",".join("?" * len(ym_list))
+                conds.append(f"ym IN ({ph})")
+                params.extend(ym_list)
+            if dev_list:
+                ph = ",".join("?" * len(dev_list))
+                conds.append(f"device IN ({ph})")
+                params.extend(dev_list)
+            where = ("WHERE " + " AND ".join(conds)) if conds else ""
+            paths = [
+                r[0]
+                for r in conn.execute(f"SELECT path FROM processed {where}", params)
+            ]
+            run_at = _now()
+            # 批量提交：每 1000 个文件一次性落库，减少事务提交开销
+            _BATCH = 1000
+            total = len(paths)
+            step = max(1, total // 100)
+            buf = []
+            done = 0
+            for p, res in compute_paths(paths, workers, stop_event, use_process=use_process):
+                if stop_event is not None and stop_event.is_set():
+                    break  # 用户取消：停止取后续结果，已算出的 buf 照常落库
+                buf.append((p, res))
+                done += 1
+                if len(buf) >= _BATCH:
+                    _upsert_rows_batch(conn, buf, run_at)
+                    buf = []
+                if on_progress is not None and done % step == 0:
+                    on_progress(done, total)
+            if buf:
                 _upsert_rows_batch(conn, buf, run_at)
-                buf = []
-            if on_progress is not None and done % step == 0:
+            if on_progress is not None:
                 on_progress(done, total)
-        if buf:
-            _upsert_rows_batch(conn, buf, run_at)
-        if on_progress is not None:
-            on_progress(done, total)
+    finally:
+        # 显式释放：本次用了多进程则跑完立即关闭进程池，归还子进程内存
+        if use_process:
+            _shutdown_proc_pool(wait=True)
     return done
 
 
 def recalc_missing(conn, lock, ym_list, dev_list=None, on_progress=None, stop_event=None,
-                   workers=None):
+                   workers=None, use_process=False):
     """仅补齐「缺失指标」的文件（避免全量重算），覆盖两类情况：
     - processed 有记录但 metrics 无对应行（历史上关掉『找到新增后算指标』扫入的文件）；
     - metrics 行存在，但注册表新增了指标列、该行该列为 NULL（旧文件缺新指标）。
@@ -573,47 +628,52 @@ def recalc_missing(conn, lock, ym_list, dev_list=None, on_progress=None, stop_ev
     workers 为并行计算线程数（None/1=串行）；落库仍单线程批量串行。
     """
     cm = lock if lock is not None else _nullcontext()
-    with cm:
-        conds, params = [], []
-        if ym_list:
-            ph = ",".join("?" * len(ym_list))
-            conds.append(f"p.ym IN ({ph})")
-            params.extend(ym_list)
-        if dev_list:
-            ph = ",".join("?" * len(dev_list))
-            conds.append(f"p.device IN ({ph})")
-            params.extend(dev_list)
-        where = ("WHERE " + " AND ".join(conds)) if conds else ""
-        # 缺失判定：无 metrics 行，或任一指标列为 NULL
-        null_conds = ["m.path IS NULL"]
-        for m in METRICS.values():
-            null_conds.append(f"m.{m['column']} IS NULL")
-        missing_where = "(" + " OR ".join(null_conds) + ")"
-        sql = (f"SELECT p.path FROM processed p "
-               f"LEFT JOIN metrics m ON p.path = m.path "
-               f"{where} {'AND' if where else 'WHERE'} {missing_where}")
-        paths = [r[0] for r in conn.execute(sql, params)]
-        run_at = _now()
-        # 批量提交：每 1000 个文件一次性落库，减少事务提交开销
-        _BATCH = 1000
-        total = len(paths)
-        step = max(1, total // 100)
-        buf = []
-        done = 0
-        for p, res in compute_paths(paths, workers, stop_event):
-            if stop_event is not None and stop_event.is_set():
-                break  # 用户取消：停止取后续结果，已算出的 buf 照常落库
-            buf.append((p, res))
-            done += 1
-            if len(buf) >= _BATCH:
+    try:
+        with cm:
+            conds, params = [], []
+            if ym_list:
+                ph = ",".join("?" * len(ym_list))
+                conds.append(f"p.ym IN ({ph})")
+                params.extend(ym_list)
+            if dev_list:
+                ph = ",".join("?" * len(dev_list))
+                conds.append(f"p.device IN ({ph})")
+                params.extend(dev_list)
+            where = ("WHERE " + " AND ".join(conds)) if conds else ""
+            # 缺失判定：无 metrics 行，或任一指标列为 NULL
+            null_conds = ["m.path IS NULL"]
+            for m in METRICS.values():
+                null_conds.append(f"m.{m['column']} IS NULL")
+            missing_where = "(" + " OR ".join(null_conds) + ")"
+            sql = (f"SELECT p.path FROM processed p "
+                   f"LEFT JOIN metrics m ON p.path = m.path "
+                   f"{where} {'AND' if where else 'WHERE'} {missing_where}")
+            paths = [r[0] for r in conn.execute(sql, params)]
+            run_at = _now()
+            # 批量提交：每 1000 个文件一次性落库，减少事务提交开销
+            _BATCH = 1000
+            total = len(paths)
+            step = max(1, total // 100)
+            buf = []
+            done = 0
+            for p, res in compute_paths(paths, workers, stop_event, use_process=use_process):
+                if stop_event is not None and stop_event.is_set():
+                    break  # 用户取消：停止取后续结果，已算出的 buf 照常落库
+                buf.append((p, res))
+                done += 1
+                if len(buf) >= _BATCH:
+                    _upsert_rows_batch(conn, buf, run_at)
+                    buf = []
+                if on_progress is not None and done % step == 0:
+                    on_progress(done, total)
+            if buf:
                 _upsert_rows_batch(conn, buf, run_at)
-                buf = []
-            if on_progress is not None and done % step == 0:
+            if on_progress is not None:
                 on_progress(done, total)
-        if buf:
-            _upsert_rows_batch(conn, buf, run_at)
-        if on_progress is not None:
-            on_progress(done, total)
+    finally:
+        # 显式释放：本次用了多进程则跑完立即关闭进程池，归还子进程内存
+        if use_process:
+            _shutdown_proc_pool(wait=True)
     return done
 
 

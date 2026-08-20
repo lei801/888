@@ -11,7 +11,6 @@
       路径：支持通配符 * ? （自动转 SQL 的 % _），多条件用 | , ; 或空格分隔（OR 关系）
       状态：全部 / ok / simulated / 无结果
   - 底部状态栏显示当前过滤下的文件数。
-  - 「导出 CSV」按钮：将当前筛选结果导出为 CSV（UTF-8-SIG，Excel 可直接打开）。
 
 既可作为独立程序运行（python db_view.py），
 也可由扫描器主 UI 通过 open_db_view(parent) 以内嵌窗口打开。
@@ -19,15 +18,14 @@
 from __future__ import annotations
 import os
 import re
-import csv
 import json
 import sqlite3
-import datetime
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox
 import analysis
 import db_maintain   # 复用 run_maintain 做归档/瘦身（GUI 按钮触发，不再需命令行）
+import ui_common     # 共享筛选组件 LineDeviceMonthFilter / 状态色常量
 from analysis import column_defs, join_clause, classify_line   # 指标列定义 / SQL JOIN 均来自 analysis
 
 # 分页设置（仅影响界面渲染，不影响 CSV 导出）
@@ -40,9 +38,6 @@ _SORTABLE_COLS = {"设备", "月份"}
 
 # 固定列（顺序即表格显示顺序）；全部可在「显示列」对话框中勾选隐藏
 _FIXED_COLS = ["#", "设备", "月份", "路径", "处理时间"]
-
-# 导出 CSV 时用户所选列的持久化文件（下次默认沿用）
-_EXPORT_COLS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csv_export_cols.json")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DB = os.path.join(_HERE, "scan_state.db")
@@ -66,30 +61,25 @@ class DBViewApp:
         self.root.after_idle(self._autosize_columns)
 
     def _apply_style(self):
-        """统一字体 + 让表格行高随字体自适应（高分辨率下随 DPI 放大、不被裁切）。"""
+        """统一字体 + 让表格行高随字体自适应（高分辨率下随 DPI 放大、不被裁切）。
+
+        注意：ttk 样式在进程内全局共享。当查看器作为【内嵌 Toplevel】由主程序
+        open_db_view 打开时，若在此改动 '.' 通配字体或切换主题，会污染主程序界面
+        （表现为主界面按钮字体变小）。因此内嵌模式下【不】改全局样式，沿用主程序
+        已设主题；仅【独立运行】(root 为 tk.Tk) 时才应用本查看器的私有样式。
+        """
         import tkinter.font as tkfont
         style = ttk.Style(self.root)
-        # 主题：内嵌时沿用主程序已设主题；独立运行时优先原生 vista
-        try:
-            cur = style.theme_use()
-        except Exception:
-            cur = ""
-        if cur not in ("vista", "xpnative", "clam"):
-            for pref in ("vista", "xpnative", "clam"):
-                if pref in style.theme_names():
-                    try:
-                        style.theme_use(pref)
-                        break
-                    except Exception:
-                        continue
-        # 表格字体沿用全局默认（ttk 主题决定的 Treeview 内容字体，
-        # 经实测 style.configure("Treeview", font=...) 在本主题下不生效，
-        # 故不在此硬性更换字体，避免"改了等于没改"的错觉）。
-        style.configure(".", font=("Microsoft YaHei", 8))
-        # 行高随字体行距自适应（高分辨率下不被裁切）；加一点余量让行更宽松
-        row_font = tkfont.Font(font=("Microsoft YaHei", 8))
-        style.configure("Treeview", rowheight=row_font.metrics("linespace") + 8)
-        style.configure("Treeview.Heading", font=("Microsoft YaHei", 8, "bold"))
+        # 数据库表格字体：比主程序（9 号）缩小两号 = 7 号。
+        # 注意 vista 原生主题下 Treeview 内容字不跟随 '.'，必须单独显式配置。
+        tree_size = 8
+        row_font = tkfont.Font(font=("Microsoft YaHei", tree_size))
+        style.configure("Treeview", font=("Microsoft YaHei", tree_size),
+                        rowheight=row_font.metrics("linespace") + 8)
+        style.configure("Treeview.Heading", font=("Microsoft YaHei", tree_size, "bold"))
+        # 仅【独立运行】(root 为 tk.Tk) 时再设全局 '.' 字体，避免污染内嵌的主程序界面
+        if isinstance(self.root, tk.Tk):
+            style.configure(".", font=("Microsoft YaHei", tree_size))
 
     # 只读连接；mode=ro 失败则回退普通连接（我们只会 SELECT）
     def _conn(self):
@@ -184,32 +174,6 @@ class DBViewApp:
         except Exception:
             pass
 
-    # ---------- 多选列表框辅助 ----------
-    @staticmethod
-    def _mk_multi(parent, title, values, on_change):
-        """构造一个『多选列表框』分组，返回 (group_frame, listbox)。"""
-        g = ttk.LabelFrame(parent, text=title, padding=4)
-        lb = tk.Listbox(g, selectmode="extended", height=5, width=10,
-                        exportselection=0)  # exportselection=0：失去焦点仍保留选中
-        for v in values:
-            lb.insert("end", v)
-        sb = ttk.Scrollbar(g, orient="vertical", command=lb.yview)
-        lb.configure(yscrollcommand=sb.set)
-        lb.grid(row=0, column=0, sticky="ns")
-        sb.grid(row=0, column=1, sticky="ns")
-        bf = ttk.Frame(g)
-        bf.grid(row=1, column=0, columnspan=2, pady=(3, 0))
-        ttk.Button(bf, text="全选", width=5,
-                   command=lambda: (lb.selection_set(0, "end"), on_change())).grid(row=0, column=0, padx=2)
-        ttk.Button(bf, text="清空", width=5,
-                   command=lambda: (lb.selection_clear(0, "end"), on_change())).grid(row=0, column=1, padx=2)
-        lb.bind("<<ListboxSelect>>", lambda e: on_change())
-        return g, lb
-
-    @staticmethod
-    def _sel(lb: tk.Listbox):
-        return [lb.get(i) for i in lb.curselection()]
-
     # ---------- UI 构建 ----------
     def _build_ui(self, devs, yms):
         # 用于『产线→设备』展开的全部设备（不含 (空)）
@@ -218,20 +182,20 @@ class DBViewApp:
         self._lines = [ln for ln in ("E", "C", "D", "A")
                        if any(classify_line(d) == ln for d in self._devices)]
 
-        # ---- 筛选区：第一行（产线多选 / 设备多选 / 月份多选 / 路径通配） ----
+        # ---- 筛选区：第一行（产线/设备/月份 共享筛选组件 + 路径通配） ----
         frm = ttk.Frame(self.root, padding=8)
         frm.grid(row=0, column=0, sticky="ew")
-        frm.columnconfigure(3, weight=1)
+        frm.columnconfigure(1, weight=1)
 
-        g_line, self.line_lb = self._mk_multi(frm, "产线(多选)", self._lines, self._on_line_change)
-        g_line.grid(row=0, column=0, padx=(0, 8), sticky="ns")
-        g_dev, self.dev_lb = self._mk_multi(frm, "设备(多选)", devs, self._on_filter_change)
-        g_dev.grid(row=0, column=1, padx=(0, 8), sticky="ns")
-        g_ym, self.ym_lb = self._mk_multi(frm, "月份(多选)", yms, self._on_filter_change)
-        g_ym.grid(row=0, column=2, padx=(0, 8), sticky="ns")
+        # 共享组件（与任务中心同源）：产线复选联动设备 + 设备/月份多选
+        self.filter = ui_common.LineDeviceMonthFilter(
+            frm, on_change=self._on_filter_change, lines=self._lines)
+        self.filter.grid(row=0, column=0, padx=(0, 8), sticky="nsew")
+        self.filter.set_devices(devs)
+        self.filter.set_months(yms)
 
         p_grp = ttk.LabelFrame(frm, text="路径（通配符 * ?；多条件用 | 分隔，OR）", padding=4)
-        p_grp.grid(row=0, column=3, sticky="nsew")
+        p_grp.grid(row=0, column=1, sticky="nsew")
         self.q_var = tk.StringVar()
         ttk.Entry(p_grp, textvariable=self.q_var).pack(fill="x", padx=2, pady=2)
         self.q_var.trace_add("write", lambda *a: self._on_filter_change())
@@ -244,11 +208,10 @@ class DBViewApp:
         ttk.Button(frm2, text="显示列", command=self._pick_visible_columns).grid(row=0, column=1, padx=(6, 0))
         ttk.Button(frm2, text="归档旧数据", command=self._open_archive_dialog).grid(row=0, column=2, padx=(6, 0))
         ttk.Button(frm2, text="复制选中", command=self._copy_selected).grid(row=0, column=3, padx=(6, 0))
-        ttk.Button(frm2, text="导出 CSV", command=self._export_csv).grid(row=0, column=4, padx=(6, 0))
 
         # ---- 状态栏 ----
         self.stat_var = tk.StringVar(value="")
-        ttk.Label(self.root, textvariable=self.stat_var, foreground="#1a73e8").grid(
+        ttk.Label(self.root, textvariable=self.stat_var, foreground=ui_common.COLOR_INFO).grid(
             row=2, column=0, sticky="w", padx=8)
 
         # ---- 表格（列定义来自 analysis，新增指标自动出现） ----
@@ -395,27 +358,9 @@ class DBViewApp:
         self._refresh()
 
     def _reset_filters(self):
-        self.line_lb.selection_clear(0, "end")
-        self.dev_lb.selection_clear(0, "end")
-        self.ym_lb.selection_clear(0, "end")
+        self.filter.reset()
         self.q_var.set("")
         self.stat_var.set("(全部)")
-        self._on_filter_change()
-
-    # ---------- 产线 → 设备 联动（单向） ----------
-    def _on_line_change(self):
-        """产线选择变化时，自动勾选/清空设备列表框中匹配的设备号（单向联动）。
-        选中产线 -> 设备框只保留这些产线下的设备；(空) 设备不属于任何产线，故不选。
-        """
-        lines = set(self._sel(self.line_lb))
-        self.dev_lb.selection_clear(0, "end")
-        if lines:
-            for i in range(self.dev_lb.size()):
-                d = self.dev_lb.get(i)
-                if d == "(空)":
-                    continue
-                if classify_line(d) in lines:
-                    self.dev_lb.selection_set(i)
         self._on_filter_change()
 
     # ---------- 数值解析 ----------
@@ -431,8 +376,8 @@ class DBViewApp:
 
     # ---------- 构建查询（筛选 + 通配符多选） ----------
     def _query_sql(self, limit=None, offset=0):
-        dev_sel = self._sel(self.dev_lb)
-        ym_sel = self._sel(self.ym_lb)
+        dev_sel = self.filter.selected_devices()
+        ym_sel = self.filter.selected_months()
         q = self.q_var.get().strip()
 
         wheres, params = [], []
@@ -715,150 +660,6 @@ class DBViewApp:
         # 1.5 秒后恢复原有计数显示
         self.root.after(1500, lambda: self.stat_var.set(f"共 {len(self._raw_rows)} 个文件"))
 
-    # ---------- 导出 CSV ----------
-    def _load_export_cols(self):
-        """读取上次导出的列选择（JSON）。返回选中列名集合；无/损坏则返回 None。"""
-        try:
-            with open(_EXPORT_COLS_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                return set(data)
-        except Exception:
-            pass
-        return None
-
-    def _save_export_cols(self, cols):
-        """持久化本次导出的列选择。"""
-        try:
-            with open(_EXPORT_COLS_PATH, "w", encoding="utf-8") as f:
-                json.dump(list(cols), f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-
-    def _pick_export_columns(self):
-        """弹出列选择对话框，返回按原顺序选中的列名列表；取消或未选返回 None。
-        选中的列会被持久化（下次默认沿用）。"""
-        result = []
-        saved = self._load_export_cols()
-
-        dlg = tk.Toplevel(self.root)
-        dlg.title("选择导出列")
-        dlg.grab_set()          # 模态（不调用 transient，以保留最大/最小化按钮）
-        dlg.resizable(True, True)
-        dlg.geometry("820x680")  # 整体放大，避免勾选区被压缩、底部按钮被挤出
-        dlg.withdraw()   # 先隐藏，避免默认位置闪现
-        # 导出始终提供「全部列」选择（固定列 + 全量指标列），不受查看器可见列影响
-        metric_cols = self._all_metric_cols_list
-        frm = ttk.Frame(dlg, padding=10)
-        frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text="选择要导出的列（默认沿用上次选择）：").pack(anchor="w", pady=(0, 6))
-
-        # ---- 固定列分组（横排，与「显示列」布局一致） ----
-        fixed_frm = ttk.Frame(frm, borderwidth=1, relief="solid")
-        fixed_frm.pack(fill="x", pady=(0, 8))
-        fvars = {}
-        _fixed_names = {"#": "序号", "设备": "设备", "月份": "月份",
-                        "路径": "路径", "处理时间": "处理时间"}
-        for i, col in enumerate(_FIXED_COLS):
-            init = col in saved if saved is not None else True
-            v = tk.BooleanVar(value=init)
-            fvars[col] = v
-            ttk.Checkbutton(fixed_frm, text=_fixed_names[col],
-                            variable=v).grid(row=0, column=i, sticky="w",
-                                             padx=8, pady=2)
-
-        ttk.Label(frm, text="指标列：").pack(anchor="w", pady=(0, 6))
-
-        # 可滚动的勾选区：自适应列数（参照主程序手动导出列），窗口拉伸时自动重排
-        canv_frame = ttk.Frame(frm, borderwidth=1, relief="solid")
-        canv_frame.pack(fill="both", expand=True, pady=(0, 8))
-        canv = tk.Canvas(canv_frame, highlightthickness=0, width=760, height=420)
-        sb = ttk.Scrollbar(canv_frame, orient="vertical", command=canv.yview)
-        inner = ttk.Frame(canv)
-        inner.bind("<Configure>",
-                   lambda e: canv.configure(scrollregion=canv.bbox("all")))
-        _win = canv.create_window((0, 0), window=inner, anchor="nw")
-        canv.bind("<Configure>",
-                  lambda e: canv.itemconfigure(_win, width=e.width))
-        canv.configure(yscrollcommand=sb.set)
-        canv.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        # 鼠标滚轮（中键/触控板）滚动
-        canv.bind("<MouseWheel>",
-                  lambda e: canv.yview_scroll(int(-e.delta / 120), "units"))
-        canv.bind("<Button-4>",
-                  lambda e: canv.yview_scroll(-1, "units"))
-        canv.bind("<Button-5>",
-                  lambda e: canv.yview_scroll(1, "units"))
-
-        vars_ = {}
-        # metric_cols 里是 label（中文显示名），需经 _label2key 反查回 METRICS 的 key
-        l2k = getattr(self, "_label2key", {}) or {}
-        _exp_widgets = []
-        for label in metric_cols:
-            key = l2k.get(label, label)
-            init = label in saved if saved is not None else True
-            v = tk.BooleanVar(value=init)
-            vars_[label] = v
-            wd = ttk.Checkbutton(inner, text="%s  (%s)" % (label, key), variable=v)
-            _exp_widgets.append(wd)
-
-        # 自适应列数：按实际测量的每列宽度估算每行列数，窗口/面板拉伸时自动重排
-        # 不再用固定估算值(150)直接算，因为中文"名称 (key)"实际更宽，固定估算会溢出裁切最右列
-        _GAP = 12   # 列间距
-        def _measure_col_w():
-            # 取所有复选框实际请求宽度中的最大值作为单列宽，保证该行每一列都完整放得下
-            dlg.update_idletasks()
-            _ws = [w.winfo_reqwidth() for w in _exp_widgets]
-            return max(_ws) if _ws else 150
-        def _relayout_exp_cols():
-            _w = canv.winfo_width()
-            _col_w = _measure_col_w()
-            _n = max(1, _w // (_col_w + _GAP))
-            for _i, _wd in enumerate(_exp_widgets):
-                _wd.grid(row=_i // _n, column=_i % _n, sticky="w",
-                         padx=(0, 12), pady=2)
-            canv.configure(scrollregion=canv.bbox("all"))
-
-        canv.bind("<Configure>", lambda e: _relayout_exp_cols())
-
-        btn_frm = ttk.Frame(frm)
-        btn_frm.pack(fill="x", pady=(8, 0))
-
-        def select_all(val):
-            for v in vars_.values():
-                v.set(val)
-            for v in fvars.values():
-                v.set(val)
-
-        def on_ok():
-            sel = ([c for c in _FIXED_COLS if fvars[c].get()]
-                   + [n for n in metric_cols if vars_[n].get()])
-            result.extend(sel)
-            self._save_export_cols(sel)   # 持久化
-            dlg.destroy()
-
-        def on_cancel():
-            dlg.destroy()
-
-        ttk.Button(btn_frm, text="全选", command=lambda: select_all(True)).pack(
-            side="left", padx=(0, 6))
-        ttk.Button(btn_frm, text="全不选", command=lambda: select_all(False)).pack(
-            side="left", padx=(0, 6))
-        ttk.Button(btn_frm, text="取消", command=on_cancel).pack(
-            side="right", padx=(6, 0))
-        ttk.Button(btn_frm, text="确定", command=on_ok, default="active").pack(side="right")
-        # 居中于父窗口后再显示（消除闪烁）
-        dlg.update_idletasks()
-        _w, _h = dlg.winfo_width(), dlg.winfo_height()
-        _x = self.root.winfo_rootx() + (self.root.winfo_width() - _w) // 2
-        _y = self.root.winfo_rooty() + (self.root.winfo_height() - _h) // 2
-        dlg.geometry("+%d+%d" % (max(0, _x), max(0, _y)))
-        dlg.deiconify()
-        dlg.lift()
-        dlg.wait_window(dlg)
-        return result or None
-
     def _pick_visible_columns(self):
         """『显示列』对话框：勾选查看器表格要显示的列（固定列 + 指标列均可勾选隐藏）。
         固定列横排在顶部，指标列可滚动区自适应列数（窗口拉伸自动重排）。"""
@@ -991,66 +792,6 @@ class DBViewApp:
         """打开归档设置对话框（可设保留月份、预览、手动/自动归档）。"""
         ArchiveDialog(self.root, self)
 
-    def _export_csv(self):
-        sql, params, _count_sql, _count_params = self._query_sql()   # 导出不加 LIMIT，导出全部匹配行
-        if sql is None:
-            return
-        try:
-            c = self._conn()
-            rows = c.execute(sql, params).fetchall()
-            c.close()
-        except sqlite3.Error as e:
-            messagebox.showerror("导出失败", str(e), parent=self.root)
-            return
-        if not rows:
-            messagebox.showinfo("导出", "当前筛选无数据，未导出。", parent=self.root)
-            return
-
-        # 先让用户选择要导出的列
-        sel = self._pick_export_columns()
-        if sel is None:
-            return
-
-        fn = filedialog.asksaveasfilename(
-            title="导出 CSV",
-            defaultextension=".csv",
-            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
-            initialfile="scan_state_export_%s.csv"
-                       % datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
-        if not fn:
-            return
-        try:
-            metric_labels = [d[1] for d in column_defs()]
-
-            def header_of(name):
-                return "序号" if name == "#" else name
-
-            def value_of(name, i, row):
-                if name == "#":
-                    return i
-                if name == "设备":
-                    return row[0] or ""
-                if name == "月份":
-                    return row[1] or ""
-                if name == "路径":
-                    return row[2]
-                if name == "大小":
-                    return row[3] if row[3] is not None else ""
-                if name == "处理时间":
-                    return row[4] or ""
-                k = metric_labels.index(name)  # 指标列
-                v = row[5 + k]
-                return v if v is not None else ""
-
-            with open(fn, "w", newline="", encoding="utf-8-sig") as f:
-                w = csv.writer(f)
-                w.writerow([header_of(n) for n in sel])
-                for i, row in enumerate(rows, 1):
-                    w.writerow([value_of(n, i, row) for n in sel])
-            messagebox.showinfo("导出成功", f"已导出 {len(rows)} 行、{len(sel)} 列到：\n{fn}", parent=self.root)
-        except Exception as e:
-            messagebox.showerror("导出失败", str(e), parent=self.root)
-
 
 def open_db_view(parent=None):
     """打开查看器。parent 为 None 时独立运行(自建 Tk + mainloop)；
@@ -1135,7 +876,7 @@ class ArchiveDialog(tk.Toplevel):
         ttk.Button(frm, text="预览将归档数量", command=self._preview).grid(
             row=1, column=0, columnspan=2, sticky="w", pady=6)
         self.prev_var = tk.StringVar(value="（点上方预览）")
-        ttk.Label(frm, textvariable=self.prev_var, foreground="#1a73e8").grid(
+        ttk.Label(frm, textvariable=self.prev_var, foreground=ui_common.COLOR_INFO).grid(
             row=2, column=0, columnspan=3, sticky="w")
 
         # 手动归档
@@ -1154,7 +895,7 @@ class ArchiveDialog(tk.Toplevel):
             row=5, column=0, columnspan=3, sticky="w")
 
         self.auto_stat_var = tk.StringVar(value="自动归档：未启用")
-        ttk.Label(frm, textvariable=self.auto_stat_var, foreground="#666").grid(
+        ttk.Label(frm, textvariable=self.auto_stat_var, foreground=ui_common.COLOR_DIM).grid(
             row=6, column=0, columnspan=3, sticky="w")
 
         ttk.Button(frm, text="关闭", command=self.destroy).grid(
