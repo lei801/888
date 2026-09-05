@@ -1,0 +1,39 @@
+
+新建表
+度量值 = {1}
+
+通道分类 = DATATABLE(
+    "通道", STRING,
+    {
+        {"563"},
+        {"570"},
+        {"589"},
+        {"590"},
+        {"656"}
+    }
+)
+
+内层MISS_按通道 = 
+SWITCH(
+    SELECTEDVALUE('通道分类'[通道]),
+    "563", [内层563],
+    "570", [内层570],
+    "589", [内层589],
+    "590", [内层590],
+    "656", [内层656],
+    BLANK()
+)
+
+
+dDate = ADDCOLUMNS (
+    CALENDARAUTO (),
+    "Year", YEAR ( [Date] ),
+    "Quartername", "Q" & QUARTER ( [Date] ),
+    "Month", FORMAT ( [Date], "mmmm" ),
+    "Month Number", MONTH ( [Date] ),
+    "Quarternumber", ROUNDUP(MONTH ( [Date] )/3,0),
+    "Yearquartersort", YEAR ( [Date] )*10+ROUNDUP (MONTH ([Date])/3,0),
+    "Year-Quarter", YEAR ( [Date] )&"-"&"Q" & QUARTER ( [Date] ),
+    "Year-Month",YEAR ( [Date] ) & "-"& FORMAT ( [Date], "mmm" ),
+    "Yearmonthsort", YEAR ( [Date] )*100+MONTH ( [Date] )
+)Power BI中为什么要新建这个数据？不能用原来的数据里面的日期吗
