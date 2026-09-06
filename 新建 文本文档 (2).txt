@@ -37,3 +37,20 @@ dDate = ADDCOLUMNS (
     "Year-Month",YEAR ( [Date] ) & "-"& FORMAT ( [Date], "mmm" ),
     "Yearmonthsort", YEAR ( [Date] )*100+MONTH ( [Date] )
 )Power BI中为什么要新建这个数据？不能用原来的数据里面的日期吗
+
+
+
+dDate = 
+ADDCOLUMNS (
+    CALENDARAUTO (),
+    "年", YEAR ( [Date] ),
+    "季度名", "Q" & QUARTER ( [Date] ),
+    "月名", FORMAT ( [Date], "mmmm" ),
+    "月序号", MONTH ( [Date] ),
+    "季度序号", ROUNDUP ( MONTH ( [Date] ) / 3, 0 ),
+    "年季度排序", YEAR ( [Date] ) * 10 + ROUNDUP ( MONTH ( [Date] ) / 3, 0 ),
+    "年季度", YEAR ( [Date] ) & "-" & "Q" & QUARTER ( [Date] ),
+    "年月", YEAR ( [Date] ) & "-" & FORMAT ( [Date], "mmm" ),
+    "年月排序", YEAR ( [Date] ) * 100 + MONTH ( [Date] ),
+    "月份", YEAR ( [Date] ) * 100 + MONTH ( [Date] )
+)
